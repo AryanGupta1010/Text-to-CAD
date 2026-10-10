@@ -296,13 +296,28 @@ def get_job_status(job_id: str):
 @app.get("/cad/jobs/{job_id}/preview")
 def get_preview_artifact(job_id: str, settings: Settings = Depends(get_settings)):
     """Serves the verified 3D preview mesh (STL or GLB) for Three.js."""
-    job_dir = Path(settings.artifacts_dir) / job_id
-    if not job_dir.exists():
-        raise HTTPException(status_code=404, detail="Job directory not found.")
+    safe_job_id = Path(job_id).name
+    backend_base = Path(__file__).resolve().parent.parent
+    
+    # Check all possible canonical artifact locations
+    candidates = [
+        Path(settings.artifacts_dir) / safe_job_id,
+        backend_base / "artifacts" / safe_job_id,
+        backend_base.parent / "backend" / "artifacts" / safe_job_id,
+        backend_base / "backend" / "artifacts" / safe_job_id,
+    ]
+    job_dir = next((c for c in candidates if c.exists()), None)
+
+    if not job_dir:
+        # Check if job is still in progress
+        job_status = JOB_STORE.get(safe_job_id)
+        if job_status and job_status.status in ["pending", "extracting", "retrieving", "generating", "executing"]:
+            raise HTTPException(status_code=425, detail="CAD model generation is currently in progress. Preview will be ready once execution finishes.")
+        raise HTTPException(status_code=404, detail=f"Job directory for '{safe_job_id}' not found.")
 
     # Check for GLB first, then STL
     glb_files = list(job_dir.glob("*.glb")) + list(job_dir.glob("*.GLB"))
-    if glb_files:
+    if glb_files and glb_files[0].stat().st_size > 0:
         return FileResponse(
             str(glb_files[0].resolve()),
             media_type="model/gltf-binary",
@@ -310,24 +325,35 @@ def get_preview_artifact(job_id: str, settings: Settings = Depends(get_settings)
         )
 
     stl_files = list(job_dir.glob("*.stl")) + list(job_dir.glob("*.STL"))
-    if stl_files:
+    if stl_files and stl_files[0].stat().st_size > 0:
         return FileResponse(
             str(stl_files[0].resolve()),
             media_type="model/stl",
             filename=stl_files[0].name,
         )
 
-    raise HTTPException(status_code=404, detail="No preview artifact (STL or GLB) available for this job.")
+    # Check if job failed
+    job_status = JOB_STORE.get(safe_job_id)
+    if job_status and job_status.status in ["pending", "extracting", "retrieving", "generating", "executing"]:
+        raise HTTPException(status_code=425, detail="Model preview being generated...")
+        
+    raise HTTPException(status_code=404, detail=f"No preview mesh (STL or GLB) generated for job '{safe_job_id}'.")
 
 
 @app.get("/cad/jobs/{job_id}/artifacts/{format_name}")
 def download_artifact(job_id: str, format_name: str, settings: Settings = Depends(get_settings)):
     """Downloads an artifact in a supported format with path sanitization."""
-    # Sanitize job_id and format_name
     safe_job_id = Path(job_id).name
-    job_dir = (Path(settings.artifacts_dir) / safe_job_id).resolve()
+    backend_base = Path(__file__).resolve().parent.parent
+    candidates = [
+        Path(settings.artifacts_dir) / safe_job_id,
+        backend_base / "artifacts" / safe_job_id,
+        backend_base.parent / "backend" / "artifacts" / safe_job_id,
+        backend_base / "backend" / "artifacts" / safe_job_id,
+    ]
+    job_dir = next((c for c in candidates if c.exists()), None)
     
-    if not job_dir.exists():
+    if not job_dir:
         raise HTTPException(status_code=404, detail="Job not found.")
 
     format_lower = format_name.lower().lstrip(".")

@@ -368,10 +368,13 @@ END-ISO-10303-21;
         t0: float,
     ) -> ExecutionReport:
         """Mock execution mode clearly labeled as simulated output."""
-        stdout = "[MOCK MODE] Simulated CAD execution started.\n[MOCK MODE] Synthesizing mock STL and STEP artifacts.\n[MOCK MODE] Execution finished successfully."
-        # Create dummy artifacts
+        stdout = "[MOCK MODE] Simulated CAD execution started.\n[MOCK MODE] Synthesizing mock STL, GLB, and STEP artifacts.\n[MOCK MODE] Execution finished successfully."
+        # Generate renderable 3D mesh for Three.js viewer
+        container_mesh = self._construct_hollow_cylinder_mesh(30.0, 27.0, 100.0, 4.0, sections=48)
+        container_mesh.export(str(job_dir / "model.stl"))
+        container_mesh.export(str(job_dir / "preview.glb"))
         (job_dir / "model.step").write_text("/* MOCK STEP FILE */", encoding="utf-8")
-        (job_dir / "model.stl").write_text("solid mock\nendsolid mock", encoding="utf-8")
+        (job_dir / "model.FCStd").write_text("# MOCK FreeCAD document\n", encoding="utf-8")
         artifacts = self._scan_artifacts(job_dir)
         return ExecutionReport(
             job_id=job_id,

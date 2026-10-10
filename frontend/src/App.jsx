@@ -149,6 +149,7 @@ export default function App() {
             jobId={activeJobId}
             isExecuting={isGenerating || isExecutingScript}
             validationReport={jobStatus?.validation_report}
+            jobStatus={jobStatus}
           />
           <ValidationPanel
             validationReport={jobStatus?.validation_report}

@@ -3,13 +3,14 @@ import * as THREE from 'three';
 import { STLLoader } from 'three/examples/jsm/loaders/STLLoader.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
-import { Maximize2, RotateCcw, Grid, Eye, AlertCircle, Loader2, Compass } from 'lucide-react';
+import { Maximize2, RotateCcw, Grid, Eye, AlertCircle, Loader2, Compass, RefreshCw } from 'lucide-react';
 import { getPreviewArtifactUrl } from '../services/api';
 
 export default function ModelViewer({
   jobId,
   isExecuting,
   validationReport,
+  jobStatus,
 }) {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
@@ -112,11 +113,20 @@ export default function ModelViewer({
     };
   }, []);
 
-  // Load preview mesh when jobId changes
+  // Load preview mesh when execution completes or artifacts are ready
   useEffect(() => {
     if (!jobId) return;
+    if (isExecuting) {
+      setError(null);
+      return;
+    }
+    // If job is in intermediate state, wait
+    if (jobStatus && ['pending', 'extracting', 'retrieving', 'generating'].includes(jobStatus.status)) {
+      setError(null);
+      return;
+    }
     loadCADArtifact(jobId);
-  }, [jobId]);
+  }, [jobId, isExecuting, jobStatus?.status, jobStatus?.updated_at, validationReport]);
 
   const loadCADArtifact = async (id) => {
     setIsLoading(true);
@@ -124,19 +134,25 @@ export default function ModelViewer({
     const scene = sceneRef.current;
     if (!scene) return;
 
-    // Remove existing mesh
-    if (currentMeshRef.current) {
-      scene.remove(currentMeshRef.current);
-      currentMeshRef.current = null;
-    }
-
     const previewUrl = getPreviewArtifactUrl(id);
 
     try {
-      // Fetch binary blob to determine if GLB or STL
       const res = await fetch(previewUrl);
+      if (res.status === 425) {
+        // Artifact in progress
+        setIsLoading(true);
+        return;
+      }
       if (!res.ok) {
-        throw new Error(`CAD preview artifact not available for job ${id}`);
+        if (isExecuting) return;
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || `CAD preview artifact not available for job ${id}`);
+      }
+
+      // Remove previous mesh once new artifact is successfully fetched
+      if (currentMeshRef.current) {
+        scene.remove(currentMeshRef.current);
+        currentMeshRef.current = null;
       }
 
       const contentType = res.headers.get('content-type') || '';
@@ -176,7 +192,9 @@ export default function ModelViewer({
       }
     } catch (e) {
       console.warn('Preview mesh load error:', e);
-      setError(e.message || 'Could not load CAD mesh artifact.');
+      if (!isExecuting) {
+        setError(e.message || 'Could not load CAD mesh artifact.');
+      }
       setIsLoading(false);
     }
   };
@@ -282,6 +300,9 @@ export default function ModelViewer({
           </button>
           <button className={`btn btn-secondary btn-sm ${wireframe ? 'btn-primary' : ''}`} onClick={toggleWireframe} title="Toggle Wireframe Mesh">
             <Eye size={13} />
+          </button>
+          <button className="btn btn-secondary btn-sm" onClick={() => jobId && loadCADArtifact(jobId)} title="Reload 3D Model">
+            <RefreshCw size={13} />
           </button>
           <button className="btn btn-secondary btn-sm" onClick={handleResetCamera} title="Fit & Reset Camera">
             <RotateCcw size={13} />
