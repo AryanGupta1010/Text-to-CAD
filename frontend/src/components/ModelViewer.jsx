@@ -125,7 +125,22 @@ export default function ModelViewer({
       setError(null);
       return;
     }
-    loadCADArtifact(jobId);
+    // If job failed, display the actual root cause message directly
+    if (jobStatus?.status === 'failed') {
+      setIsLoading(false);
+      setError(jobStatus.error_message || 'CAD model generation failed. Check the execution logs for details.');
+      return;
+    }
+    // If clarification is needed, notify user
+    if (jobStatus?.status === 'clarification_needed') {
+      setIsLoading(false);
+      setError('Clarification required: Please answer the questions in the prompt panel to continue generation.');
+      return;
+    }
+
+    if (jobStatus?.status === 'completed' || jobStatus?.preview_url || jobStatus?.artifacts?.some(a => a.is_preview)) {
+      loadCADArtifact(jobId);
+    }
   }, [jobId, isExecuting, jobStatus?.status, jobStatus?.updated_at, validationReport]);
 
   const loadCADArtifact = async (id) => {

@@ -31,7 +31,7 @@ class ContextBuilder:
         }
         sections.append("### VALIDATED CAD SPECIFICATION ###\n" + json.dumps(spec_summary, indent=2))
 
-        # 2. Retrieved Official CAD Knowledge & Verified Scripts
+        # 2. Retrieved Official CAD Knowledge & Verified Scripts (Top 2, compact snippets)
         sections.append("### RETRIEVED CAD API REFERENCE & VERIFIED SCRIPTS ###")
         
         # Sort chunks to place verified scripts first
@@ -40,27 +40,33 @@ class ContextBuilder:
             key=lambda c: 0 if c.document_type == "verified_script" else 1,
         )
 
-        for chunk in sorted_chunks:
+        char_budget = 1800
+        used_chars = 0
+        for chunk in sorted_chunks[:2]:
             doc_ids.append(chunk.document_id)
             title = chunk.metadata.get("title", chunk.document_id)
             source = chunk.source
             doc_type = chunk.document_type
             
-            snippet = f"--- [{doc_type.upper()}] {title} (Source: {source}, ID: {chunk.document_id}) ---\n"
-            snippet += chunk.content.strip() + "\n"
-            sections.append(snippet)
+            # Keep snippet concise to ensure fast local LLM prompt evaluation
+            clean_content = chunk.content.strip()
+            if len(clean_content) > 600:
+                clean_content = clean_content[:600] + "\n... [truncated]"
+            
+            snippet = f"--- [{doc_type.upper()}] {title} (ID: {chunk.document_id}) ---\n"
+            snippet += clean_content + "\n"
+            
+            if used_chars + len(snippet) < char_budget:
+                sections.append(snippet)
+                used_chars += len(snippet)
 
-        # 3. Geometric Edge Cases & Best Practices
-        sections.append("""### MODELING BEST PRACTICES & KERNEL CONSTRAINTS ###
-1. Clean Face Subtraction: When cutting an open-top container, extend the cutting cylinder height by +1.0 mm beyond the top face, and translate it by bottom_thickness along Z:
-   `inner_cyl = Part.makeCylinder(inner_radius, height - bottom_thickness + 1.0, FreeCAD.Vector(0, 0, bottom_thickness), FreeCAD.Vector(0, 0, 1))`
-2. Verification: Check `shape.isValid()` and `not shape.isNull()` before adding to document.
-3. Export: If output formats include STEP and STL, call:
-   `container.exportStep("model.step")`
-   `container.exportStl("model.stl")`
-   `doc.saveAs("model.FCStd")`
-4. Parameters: Define variables at top of function matching specification parameters.
+        # 3. Geometric Best Practices (Concise)
+        sections.append("""### MODELING BEST PRACTICES ###
+1. Hollow Cylinders: `inner_cyl = Part.makeCylinder(inner_radius, height - bottom_thickness + 1.0, FreeCAD.Vector(0,0,bottom_thickness))`
+2. Verification: Verify `shape.isValid()` before adding to doc.
+3. Export: Call `container.exportStep("model.step")` and `container.exportStl("model.stl")`.
 """)
 
         assembled = "\n\n".join(sections)
+        return assembled, doc_ids
         return assembled, doc_ids

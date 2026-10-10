@@ -309,11 +309,14 @@ def get_preview_artifact(job_id: str, settings: Settings = Depends(get_settings)
     job_dir = next((c for c in candidates if c.exists()), None)
 
     if not job_dir:
-        # Check if job is still in progress
         job_status = JOB_STORE.get(safe_job_id)
         if job_status and job_status.status in ["pending", "extracting", "retrieving", "generating", "executing"]:
             raise HTTPException(status_code=425, detail="CAD model generation is currently in progress. Preview will be ready once execution finishes.")
-        raise HTTPException(status_code=404, detail=f"Job directory for '{safe_job_id}' not found.")
+        if job_status and job_status.status == "failed":
+            raise HTTPException(status_code=404, detail=f"CAD model generation failed: {job_status.error_message or 'Execution failure'}")
+        if job_status and job_status.status == "clarification_needed":
+            raise HTTPException(status_code=404, detail="Clarification needed for missing dimensions before 3D preview can be built.")
+        raise HTTPException(status_code=404, detail=f"No preview artifacts generated for job '{safe_job_id}'.")
 
     # Check for GLB first, then STL
     glb_files = list(job_dir.glob("*.glb")) + list(job_dir.glob("*.GLB"))
@@ -376,3 +379,25 @@ def download_artifact(job_id: str, format_name: str, settings: Settings = Depend
 @app.get("/health")
 def health_check():
     return {"status": "ok", "service": "text-to-cad-rag"}
+
+
+# Mount static frontend build if it exists to allow single-command execution
+from fastapi.staticfiles import StaticFiles
+
+frontend_dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+if frontend_dist.exists():
+    assets_dir = frontend_dist / "assets"
+    if assets_dir.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+    @app.get("/")
+    def serve_frontend_index():
+        return FileResponse(str(frontend_dist / "index.html"))
+
+    @app.get("/favicon.ico")
+    def serve_favicon():
+        fav = frontend_dist / "favicon.svg"
+        if fav.exists():
+            return FileResponse(str(fav), media_type="image/svg+xml")
+        return FileResponse(str(frontend_dist / "index.html"))
+

@@ -131,9 +131,14 @@ RETRIEVED ERROR-FIXING DOCUMENTATION:
 
 Fix the issue and return the complete, corrected Python script.
 """
-        raw = self.provider.generate(
-            prompt=prompt,
-            system=ERROR_REPAIR_SYSTEM_PROMPT,
-            temperature=0.1,
-        )
-        return extract_python_code(raw)
+        try:
+            raw = self.provider.generate(
+                prompt=prompt,
+                system=ERROR_REPAIR_SYSTEM_PROMPT,
+                temperature=0.1,
+            )
+            return extract_python_code(raw)
+        except Exception as e:
+            logger.warning(f"LLM repair generation encountered issue: {e}. Falling back to parametric repair template.")
+            from backend.app.code_generator import CADCodeGenerator
+            return CADCodeGenerator(self.provider)._generate_script_from_spec(spec)

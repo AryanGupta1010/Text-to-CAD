@@ -150,7 +150,26 @@ class GeometryValidator:
         # Parameters from specification
         params = spec.parameters
         
-        # Validate Height
+        # 1. Validate Box Length / Width (if rectangular)
+        if "length" in params and "width" in params:
+            exp_l = float(params["length"])
+            exp_w = float(params["width"])
+            l_diff = abs(dx - exp_l)
+            w_diff = abs(dy - exp_w)
+            passed_l = l_diff <= self.default_tolerance or abs(dy - exp_l) <= self.default_tolerance
+            passed_w = w_diff <= self.default_tolerance or abs(dx - exp_w) <= self.default_tolerance
+            checks.append(ValidationCheck(
+                check_name="bounding_envelope_xy",
+                expected_value=f"{exp_l} x {exp_w} mm",
+                measured_value=f"{round(dx, 2)} x {round(dy, 2)} mm",
+                tolerance=self.default_tolerance,
+                passed=passed_l and passed_w,
+                explanation=f"Measured box footprint matches expected ({exp_l} x {exp_w} mm)." if (passed_l and passed_w) else f"Box footprint mismatch: expected {exp_l}x{exp_w} mm, measured {dx:.2f}x{dy:.2f} mm.",
+            ))
+            if not (passed_l and passed_w):
+                failure_reasons.append(f"Footprint mismatch ({dx:.2f}x{dy:.2f} vs expected {exp_l}x{exp_w}).")
+
+        # 2. Validate Height
         if "height" in params:
             expected_h = float(params["height"])
             h_diff = abs(dz - expected_h)
@@ -166,9 +185,10 @@ class GeometryValidator:
             if not passed_h:
                 failure_reasons.append(f"Height mismatch ({dz:.2f} mm vs expected {expected_h:.2f} mm).")
 
-        # Validate Outer Diameter / Radius
-        if "outer_radius" in params:
-            expected_r = float(params["outer_radius"])
+        # 3. Validate Outer Diameter / Radius for Cylindrical/Spherical parts
+        rad_key = "outer_radius" if "outer_radius" in params else ("radius" if "radius" in params else None)
+        if rad_key and "length" not in params:
+            expected_r = float(params[rad_key])
             expected_dia = expected_r * 2.0
             dia_x_diff = abs(dx - expected_dia)
             dia_y_diff = abs(dy - expected_dia)

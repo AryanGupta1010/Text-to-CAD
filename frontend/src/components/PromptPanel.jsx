@@ -7,8 +7,12 @@ const SAMPLE_PROMPTS = [
     prompt: 'Create a hollow cylindrical container with an outer radius of 30 mm, height of 100 mm, wall thickness of 3 mm, and bottom thickness of 4 mm. Export it as a STEP file.',
   },
   {
-    label: 'Flanged Mechanical Pipe',
-    prompt: 'Create a flanged pipe with outer radius 25 mm, inner radius 20 mm, length 80 mm, and flange diameter 60 mm. Export as STEP and STL.',
+    label: 'Mechanical Box / Enclosure',
+    prompt: 'Create a rectangular box with length 60 mm, width 40 mm, and height 25 mm. Export as STEP and STL.',
+  },
+  {
+    label: 'Precision Bushing / Sleeve',
+    prompt: 'Create a cylindrical bushing with outer radius 25 mm, inner bore radius 15 mm, and length 60 mm. Export as STEP and STL.',
   },
   {
     label: 'Primitive Solid Cylinder',

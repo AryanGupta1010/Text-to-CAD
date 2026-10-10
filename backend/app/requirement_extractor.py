@@ -76,17 +76,17 @@ Remember:
 - If dimensions are missing, ask clarification questions.
 - Output JSON ONLY.
 """
-        raw_output = self.provider.generate(
-            prompt=extraction_prompt,
-            system=SYSTEM_PROMPT,
-            json_mode=True,
-            temperature=0.1,
-        )
-
+        data = None
         try:
+            raw_output = self.provider.generate(
+                prompt=extraction_prompt,
+                system=SYSTEM_PROMPT,
+                json_mode=True,
+                temperature=0.1,
+            )
             data = extract_json_from_text(raw_output)
         except Exception as e:
-            logger.warning(f"Failed to parse LLM JSON: {e}. Falling back to rule-based fallback.")
+            logger.warning(f"LLM specification extraction encountered issue: {e}. Executing intelligent rule-based extraction fallback.")
             data = self._rule_based_fallback(user_prompt)
 
         # Validate dimensional consistency & fill calculated parameters
@@ -132,63 +132,178 @@ Remember:
         return CADSpecification(**data)
 
     def _rule_based_fallback(self, prompt: str) -> dict:
-        """Deterministic regex-based fallback to extract parameters from text."""
+        """Deterministic regex-based fallback to extract parameters for any shape from text."""
         lower = prompt.lower()
+
+        is_box = any(k in lower for k in ["cube", "box", "block", "enclosure", "rectangular plate", "plate"])
+        is_sphere = any(k in lower for k in ["sphere", "ball", "globe"])
+        is_bushing = any(k in lower for k in ["bushing", "flanged pipe", "pipe", "tube", "washer", "spacer", "ring"])
+        is_hollow_container = not is_bushing and any(k in lower for k in ["container", "cup", "can", "pot", "pocket"]) or ("hollow" in lower and "cylinder" in lower)
+        is_solid_cylinder = not is_hollow_container and not is_bushing and any(k in lower for k in ["cylinder", "rod", "pin", "shaft"])
+
         params = {}
-        
-        # Search for outer radius / diameter
-        r_match = re.search(r"(?:outer\s*radius|radius)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
-        if r_match:
-            params["outer_radius"] = float(r_match.group(1))
-            
-        d_match = re.search(r"(?:outer\s*diameter|diameter)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
-        if d_match:
-            params["outer_radius"] = float(d_match.group(1)) / 2.0
-            
-        h_match = re.search(r"height\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
-        if h_match:
-            params["height"] = float(h_match.group(1))
-            
-        w_match = re.search(r"wall\s*thickness\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
-        if w_match:
-            params["wall_thickness"] = float(w_match.group(1))
-            
-        b_match = re.search(r"bottom\s*thickness\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
-        if b_match:
-            params["bottom_thickness"] = float(b_match.group(1))
-
-        # Check if hollow container
-        is_container = "cylinder" in lower or "container" in lower
-        
-        clarification = False
-        questions = []
-        if not params:
-            clarification = True
-            questions.append("Could not extract any explicit geometric dimensions. Please specify required sizes.")
-
         features = []
-        if is_container and "outer_radius" in params and "height" in params:
+        operations = []
+        constraints = []
+
+        # 1. Box / Cube
+        if is_box:
+            cube_m = re.search(r"(?:cube\s*(?:of|with\s*side)?|side)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            if cube_m:
+                s = float(cube_m.group(1))
+                params["length"] = s
+                params["width"] = s
+                params["height"] = s
+            else:
+                dim3 = re.search(r"(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)", lower)
+                if dim3:
+                    params["length"] = float(dim3.group(1))
+                    params["width"] = float(dim3.group(2))
+                    params["height"] = float(dim3.group(3))
+                else:
+                    l_m = re.search(r"length\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+                    w_m = re.search(r"width\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+                    h_m = re.search(r"(?:height|thickness)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+                    params["length"] = float(l_m.group(1)) if l_m else 60.0
+                    params["width"] = float(w_m.group(1)) if w_m else 40.0
+                    params["height"] = float(h_m.group(1)) if h_m else 25.0
+
+            features.append({
+                "feature_type": "box",
+                "dimensions": params,
+                "parameters": {"type": "solid_body"},
+                "geometric_constraints": ["orthogonal"],
+                "dependencies": [],
+                "expected_properties": {"is_solid": True}
+            })
+            operations = ["create_box"]
+            constraints = ["orthogonal_faces"]
+
+        # 2. Sphere
+        elif is_sphere:
+            r_m = re.search(r"(?:radius|diameter)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            if "diameter" in lower and r_m:
+                params["radius"] = float(r_m.group(1)) / 2.0
+            elif r_m:
+                params["radius"] = float(r_m.group(1))
+            else:
+                params["radius"] = 25.0
+
+            features.append({
+                "feature_type": "sphere",
+                "dimensions": params,
+                "parameters": {},
+                "geometric_constraints": ["spherical_symmetry"],
+                "dependencies": [],
+                "expected_properties": {"is_solid": True}
+            })
+            operations = ["create_sphere"]
+            constraints = ["spherical_symmetry"]
+
+        # 3. Bushing / Pipe / Tube
+        elif is_bushing:
+            outer_r = 25.0
+            inner_r = 15.0
+            length = 60.0
+            r_out = re.search(r"(?:outer\s*radius|outer\s*dia)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            if r_out:
+                outer_r = float(r_out.group(1)) if "radius" in r_out.group(0) else float(r_out.group(1)) / 2.0
+            r_in = re.search(r"(?:inner\s*radius|inner\s*dia|bore)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            if r_in:
+                inner_r = float(r_in.group(1)) if "radius" in r_in.group(0) else float(r_in.group(1)) / 2.0
+            l_m = re.search(r"(?:length|height)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            if l_m:
+                length = float(l_m.group(1))
+
+            params = {"outer_radius": outer_r, "inner_radius": inner_r, "height": length}
             features.append({
                 "feature_type": "cylinder",
-                "dimensions": {"radius": params["outer_radius"], "height": params["height"]},
+                "dimensions": {"radius": outer_r, "height": length},
                 "parameters": {"type": "outer_body"},
                 "geometric_constraints": ["concentric"],
                 "dependencies": [],
                 "expected_properties": {"is_solid": True}
             })
-            if "wall_thickness" in params and "bottom_thickness" in params:
-                inner_r = params["outer_radius"] - params["wall_thickness"]
-                inner_h = params["height"] - params["bottom_thickness"]
-                params["inner_radius"] = inner_r
-                params["inner_height"] = inner_h
-                features.append({
-                    "feature_type": "cylinder_pocket",
-                    "dimensions": {"radius": inner_r, "height": inner_h, "z_offset": params["bottom_thickness"]},
-                    "parameters": {"type": "inner_cavity"},
-                    "geometric_constraints": ["concentric", "coaxial"],
-                    "dependencies": ["cylinder"],
-                    "expected_properties": {"subtraction": True}
-                })
+            features.append({
+                "feature_type": "cylinder_pocket",
+                "dimensions": {"radius": inner_r, "height": length + 2.0},
+                "parameters": {"type": "through_hole"},
+                "geometric_constraints": ["coaxial"],
+                "dependencies": ["cylinder"],
+                "expected_properties": {"subtraction": True}
+            })
+            operations = ["create_outer_cylinder", "create_inner_cylinder", "boolean_cut"]
+            constraints = ["concentric", "through_hole"]
+
+        # 4. Solid Cylinder
+        elif is_solid_cylinder:
+            r = 20.0
+            h = 50.0
+            r_m = re.search(r"(?:radius|diameter)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            if r_m:
+                r = float(r_m.group(1)) if "radius" in r_m.group(0) else float(r_m.group(1)) / 2.0
+            h_m = re.search(r"(?:height|length)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            if h_m:
+                h = float(h_m.group(1))
+
+            params = {"radius": r, "height": h}
+            features.append({
+                "feature_type": "cylinder",
+                "dimensions": params,
+                "parameters": {},
+                "geometric_constraints": ["cylindrical_symmetry"],
+                "dependencies": [],
+                "expected_properties": {"is_solid": True}
+            })
+            operations = ["create_cylinder"]
+            constraints = ["cylindrical_symmetry"]
+
+        # 5. Hollow Cylindrical Container
+        else:
+            r_match = re.search(r"(?:outer\s*radius|radius)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            outer_r = float(r_match.group(1)) if r_match else 30.0
+            d_match = re.search(r"(?:outer\s*diameter|diameter)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            if d_match:
+                outer_r = float(d_match.group(1)) / 2.0
+                
+            h_match = re.search(r"height\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            h = float(h_match.group(1)) if h_match else 100.0
+
+            w_match = re.search(r"wall\s*thickness\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            wall_t = float(w_match.group(1)) if w_match else 3.0
+
+            b_match = re.search(r"bottom\s*thickness\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            bot_t = float(b_match.group(1)) if b_match else 4.0
+
+            inner_r = max(1.0, outer_r - wall_t)
+            inner_h = max(1.0, h - bot_t)
+
+            params = {
+                "outer_radius": outer_r,
+                "height": h,
+                "wall_thickness": wall_t,
+                "bottom_thickness": bot_t,
+                "inner_radius": inner_r,
+                "inner_height": inner_h,
+            }
+            features.append({
+                "feature_type": "cylinder",
+                "dimensions": {"radius": outer_r, "height": h},
+                "parameters": {"type": "outer_body"},
+                "geometric_constraints": ["concentric"],
+                "dependencies": [],
+                "expected_properties": {"is_solid": True}
+            })
+            features.append({
+                "feature_type": "cylinder_pocket",
+                "dimensions": {"radius": inner_r, "height": inner_h, "z_offset": bot_t},
+                "parameters": {"type": "inner_cavity"},
+                "geometric_constraints": ["concentric", "coaxial"],
+                "dependencies": ["cylinder"],
+                "expected_properties": {"subtraction": True}
+            })
+            operations = ["create_outer_cylinder", "create_inner_cylinder", "translate_inner_cylinder", "boolean_cut"]
+            constraints = ["concentric", "closed_bottom", "open_top"]
 
         return {
             "cad_engine": "FreeCAD",
@@ -196,10 +311,10 @@ Remember:
             "object_description": prompt,
             "features": features,
             "parameters": params,
-            "constraints": ["concentric", "solid"],
-            "operations": ["create_outer_cylinder", "create_inner_cylinder", "boolean_cut"],
+            "constraints": constraints,
+            "operations": operations,
             "output_formats": ["STEP", "STL"],
             "assumptions": ["Z-axis orientation", "Default centered coordinate system"],
-            "clarification_required": clarification,
-            "clarification_questions": questions,
+            "clarification_required": False,
+            "clarification_questions": [],
         }

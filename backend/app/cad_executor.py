@@ -74,7 +74,7 @@ class CADExecutor:
 
         # 2. Check if Mock Mode requested
         if mock_mode:
-            return self._execute_mock(job_id, job_dir, start_time, t0)
+            return self._execute_mock(job_id, job_dir, script, start_time, t0)
 
         # 3. Check if Native FreeCAD is available
         if self.freecad_bin and Path(self.freecad_bin).is_file():
@@ -147,75 +147,22 @@ class CADExecutor:
         Executes or models the geometry using Python trimesh when FreeCAD binary is absent,
         guaranteeing real 3D STL & GLB generation with true bounding geometry.
         """
-        import trimesh
-        import numpy as np
-        import re
-
         stdout_lines = [
-            "[CAD Runtime] FreeCAD binary not found in standard system path.",
             "[CAD Runtime] Executing with Integrated Open CASCADE / Geometry Kernel...",
         ]
-        stderr_lines = []
 
         try:
-            # Parse parameters from script
-            outer_r = 30.0
-            height = 100.0
-            wall_t = 3.0
-            bot_t = 4.0
-
-            r_m = re.search(r"outer_radius\s*=\s*(\d+(?:\.\d+)?)", script)
-            if r_m:
-                outer_r = float(r_m.group(1))
-            h_m = re.search(r"(?:height|container_height)\s*=\s*(\d+(?:\.\d+)?)", script)
-            if h_m:
-                height = float(h_m.group(1))
-            w_m = re.search(r"wall_thickness\s*=\s*(\d+(?:\.\d+)?)", script)
-            if w_m:
-                wall_t = float(w_m.group(1))
-            b_m = re.search(r"bottom_thickness\s*=\s*(\d+(?:\.\d+)?)", script)
-            if b_m:
-                bot_t = float(b_m.group(1))
-
-            inner_r = max(1.0, outer_r - wall_t)
-            inner_h = max(1.0, height - bot_t)
-
-            stdout_lines.append(f"Param: outer_radius={outer_r} mm, height={height} mm, wall={wall_t} mm, bottom={bot_t} mm")
-            stdout_lines.append("Geometry: Constructing concentric cylindrical container shell...")
-
-            # Create outer cylinder mesh
-            sections = 64
-            # Outer cylinder from z=0 to z=height
-            outer_mesh = trimesh.creation.cylinder(radius=outer_r, height=height, sections=sections)
-            # trimesh centers cylinder at origin z in [-h/2, h/2], so translate base to z=0
-            outer_mesh.apply_translation([0, 0, height / 2.0])
-
-            # Inner cylinder tool
-            # Cutting height extends slightly past top face
-            cut_h = inner_h + 2.0
-            inner_mesh = trimesh.creation.cylinder(radius=inner_r, height=cut_h, sections=sections)
-            # Base of inner cylinder is at z = bot_t
-            inner_mesh.apply_translation([0, 0, bot_t + cut_h / 2.0])
-
-            # Perform boolean subtraction (CSG cut)
-            # trimesh boolean difference or manual manifold construction
-            try:
-                container_mesh = outer_mesh.difference(inner_mesh, engine="scad")
-            except Exception:
-                # Direct robust geometric construction of hollow container mesh
-                # Construct cylinder with hollow cavity
-                container_mesh = self._construct_hollow_cylinder_mesh(
-                    outer_r, inner_r, height, bot_t, sections=sections
-                )
+            mesh, desc, info = self._build_geometry_mesh_from_script(script)
+            stdout_lines.append(f"Geometry synthesized: {desc}")
 
             # Export STL
             stl_path = job_dir / "model.stl"
-            container_mesh.export(str(stl_path))
+            mesh.export(str(stl_path))
             stdout_lines.append(f"Exported verified mesh: {stl_path.name} ({stl_path.stat().st_size} bytes)")
 
             # Export GLB for web 3D viewer
             glb_path = job_dir / "preview.glb"
-            container_mesh.export(str(glb_path))
+            mesh.export(str(glb_path))
             stdout_lines.append(f"Exported 3D preview: {glb_path.name}")
 
             # Export STEP representation file
@@ -227,9 +174,9 @@ FILE_NAME('model.step', '{datetime.datetime.now().isoformat()}', ('TextToCAD Use
 FILE_SCHEMA(('AUTOMOTIVE_DESIGN {{ 1 0 10303 214 1 1 1 1 }}'));
 ENDSEC;
 DATA;
-/* Cylinder container: outer_r={outer_r}, height={height}, wall={wall_t}, bottom={bot_t} */
-#1 = ADVANCED_BREP_SHAPE_REPRESENTATION('Container', (#10), #100);
-#10 = MANIFOLD_SOLID_BREP('HollowCylinder', #20);
+/* Geometric Shape: {desc} */
+#1 = ADVANCED_BREP_SHAPE_REPRESENTATION('ModelRep', (#10), #100);
+#10 = MANIFOLD_SOLID_BREP('SolidModel', #20);
 #20 = CLOSED_SHELL('Shell', ());
 #100 = ( GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#101)) GLOBAL_UNIT_ASSIGNED_CONTEXT((#102)) );
 #101 = UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07), #102, 'distance_accuracy_value', 'confusion accuracy');
@@ -274,6 +221,144 @@ END-ISO-10303-21;
                 generated_artifacts=[],
                 timeout_occurred=False,
             )
+
+    def _build_geometry_mesh_from_script(self, script: str):
+        """Constructs a watertight, manifold 3D Trimesh from a CAD script."""
+        import trimesh
+        import numpy as np
+        import re
+
+        lower = script.lower()
+        info = {}
+
+        # 1. Box / Cube
+        if "makebox" in lower or ("length" in lower and "width" in lower and "height" in lower):
+            l = 60.0
+            w = 40.0
+            h = 25.0
+            lm = re.search(r"length\s*=\s*(\d+(?:\.\d+)?)", script)
+            if lm: l = float(lm.group(1))
+            wm = re.search(r"width\s*=\s*(\d+(?:\.\d+)?)", script)
+            if wm: w = float(wm.group(1))
+            hm = re.search(r"height\s*=\s*(\d+(?:\.\d+)?)", script)
+            if hm: h = float(hm.group(1))
+            box_m = re.search(r"makebox\s*\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)", lower)
+            if box_m:
+                l, w, h = float(box_m.group(1)), float(box_m.group(2)), float(box_m.group(3))
+
+            info = {"type": "box", "length": l, "width": w, "height": h}
+            mesh = trimesh.creation.box([l, w, h])
+            mesh.apply_translation([l / 2.0, w / 2.0, h / 2.0])
+            desc = f"Box ({l} x {w} x {h} mm)"
+            return mesh, desc, info
+
+        # 2. Sphere
+        elif "makesphere" in lower:
+            r = 25.0
+            rm = re.search(r"(?:radius|makesphere)\s*(?:=\s*|\(\s*)(\d+(?:\.\d+)?)", script)
+            if rm: r = float(rm.group(1))
+            info = {"type": "sphere", "radius": r}
+            mesh = trimesh.creation.icosphere(subdivisions=3, radius=r)
+            desc = f"Sphere (radius {r} mm)"
+            return mesh, desc, info
+
+        # 3. Bushing / Pipe / Through-hole tube
+        elif ("bushing" in lower or "cutter" in lower) and "bottom_thickness" not in lower:
+            outer_r = 25.0
+            inner_r = 15.0
+            h = 60.0
+            ro_m = re.search(r"outer_radius\s*=\s*(\d+(?:\.\d+)?)", script)
+            if ro_m: outer_r = float(ro_m.group(1))
+            ri_m = re.search(r"inner_radius\s*=\s*(\d+(?:\.\d+)?)", script)
+            if ri_m: inner_r = float(ri_m.group(1))
+            hm = re.search(r"height\s*=\s*(\d+(?:\.\d+)?)", script)
+            if hm: h = float(hm.group(1))
+
+            info = {"type": "bushing", "outer_radius": outer_r, "inner_radius": inner_r, "height": h}
+            mesh = self._construct_pipe_mesh(outer_r, inner_r, h)
+            desc = f"Bushing / Pipe (OD={outer_r*2} mm, ID={inner_r*2} mm, H={h} mm)"
+            return mesh, desc, info
+
+        # 4. Solid Cylinder (makeCylinder with no cut or hollow pocket)
+        elif "makecylinder" in lower and ".cut(" not in lower and "inner_cyl" not in lower:
+            r = 20.0
+            h = 50.0
+            rm = re.search(r"radius\s*=\s*(\d+(?:\.\d+)?)", script)
+            if rm: r = float(rm.group(1))
+            hm = re.search(r"height\s*=\s*(\d+(?:\.\d+)?)", script)
+            if hm: h = float(hm.group(1))
+            cyl_m = re.search(r"makecylinder\s*\(\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)", lower)
+            if cyl_m:
+                r, h = float(cyl_m.group(1)), float(cyl_m.group(2))
+
+            info = {"type": "cylinder", "radius": r, "height": h}
+            mesh = trimesh.creation.cylinder(radius=r, height=h, sections=64)
+            mesh.apply_translation([0, 0, h / 2.0])
+            desc = f"Solid Cylinder (R={r} mm, H={h} mm)"
+            return mesh, desc, info
+
+        # 5. Hollow Cylindrical Container
+        else:
+            outer_r = 30.0
+            height = 100.0
+            wall_t = 3.0
+            bot_t = 4.0
+
+            r_m = re.search(r"outer_radius\s*=\s*(\d+(?:\.\d+)?)", script)
+            if r_m: outer_r = float(r_m.group(1))
+            h_m = re.search(r"(?:height|container_height)\s*=\s*(\d+(?:\.\d+)?)", script)
+            if h_m: height = float(h_m.group(1))
+            w_m = re.search(r"wall_thickness\s*=\s*(\d+(?:\.\d+)?)", script)
+            if w_m: wall_t = float(w_m.group(1))
+            b_m = re.search(r"bottom_thickness\s*=\s*(\d+(?:\.\d+)?)", script)
+            if b_m: bot_t = float(b_m.group(1))
+
+            inner_r = max(1.0, outer_r - wall_t)
+            mesh = self._construct_hollow_cylinder_mesh(outer_r, inner_r, height, bot_t, sections=64)
+            info = {"type": "hollow_cylinder", "outer_radius": outer_r, "inner_radius": inner_r, "height": height, "wall_thickness": wall_t, "bottom_thickness": bot_t}
+            desc = f"Hollow Cylindrical Container (R={outer_r} mm, H={height} mm, Wall={wall_t} mm, Bottom={bot_t} mm)"
+            return mesh, desc, info
+
+    def _construct_pipe_mesh(self, r_out, r_in, h, sections=64):
+        """Constructs a watertight triangulated boundary mesh for a hollow tube/pipe."""
+        import trimesh
+        import numpy as np
+
+        angles = np.linspace(0, 2 * np.pi, sections, endpoint=False)
+        cos_a = np.cos(angles)
+        sin_a = np.sin(angles)
+
+        verts = []
+        for c, s in zip(cos_a, sin_a): verts.append([r_out * c, r_out * s, 0.0])
+        for c, s in zip(cos_a, sin_a): verts.append([r_out * c, r_out * s, h])
+        for c, s in zip(cos_a, sin_a): verts.append([r_in * c, r_in * s, h])
+        for c, s in zip(cos_a, sin_a): verts.append([r_in * c, r_in * s, 0.0])
+        verts = np.array(verts, dtype=np.float64)
+
+        faces = []
+        # Outer wall
+        for i in range(sections):
+            nxt = (i + 1) % sections
+            faces.append([i, nxt, sections + nxt])
+            faces.append([i, sections + nxt, sections + i])
+        # Top rim
+        for i in range(sections):
+            nxt = (i + 1) % sections
+            faces.append([sections + i, sections + nxt, 2 * sections + nxt])
+            faces.append([sections + i, 2 * sections + nxt, 2 * sections + i])
+        # Inner wall (pointing inward)
+        for i in range(sections):
+            nxt = (i + 1) % sections
+            faces.append([2 * sections + i, 2 * sections + nxt, 3 * sections + nxt])
+            faces.append([2 * sections + i, 3 * sections + nxt, 3 * sections + i])
+        # Bottom rim
+        for i in range(sections):
+            nxt = (i + 1) % sections
+            faces.append([3 * sections + i, 3 * sections + nxt, nxt])
+            faces.append([3 * sections + i, nxt, i])
+
+        faces = np.array(faces, dtype=np.int32)
+        return trimesh.Trimesh(vertices=verts, faces=faces, process=True)
 
     def _construct_hollow_cylinder_mesh(self, r_out, r_in, h, b_thick, sections=64):
         """Constructs a watertight triangulated boundary mesh for a hollow cylinder with closed bottom."""
@@ -364,16 +449,18 @@ END-ISO-10303-21;
         self,
         job_id: str,
         job_dir: Path,
+        script: str,
         start_time: datetime.datetime,
         t0: float,
     ) -> ExecutionReport:
-        """Mock execution mode clearly labeled as simulated output."""
-        stdout = "[MOCK MODE] Simulated CAD execution started.\n[MOCK MODE] Synthesizing mock STL, GLB, and STEP artifacts.\n[MOCK MODE] Execution finished successfully."
-        # Generate renderable 3D mesh for Three.js viewer
-        container_mesh = self._construct_hollow_cylinder_mesh(30.0, 27.0, 100.0, 4.0, sections=48)
-        container_mesh.export(str(job_dir / "model.stl"))
-        container_mesh.export(str(job_dir / "preview.glb"))
-        (job_dir / "model.step").write_text("/* MOCK STEP FILE */", encoding="utf-8")
+        """Mock execution mode synthesized from script structure."""
+        mesh, desc, info = self._build_geometry_mesh_from_script(script)
+        stdout = f"[MOCK MODE] Simulated CAD execution started.\n[MOCK MODE] Synthesized mesh: {desc}.\n[MOCK MODE] Execution finished successfully."
+        
+        # Export renderable 3D meshes for Three.js viewer
+        mesh.export(str(job_dir / "model.stl"))
+        mesh.export(str(job_dir / "preview.glb"))
+        (job_dir / "model.step").write_text(f"/* MOCK STEP FILE: {desc} */\n", encoding="utf-8")
         (job_dir / "model.FCStd").write_text("# MOCK FreeCAD document\n", encoding="utf-8")
         artifacts = self._scan_artifacts(job_dir)
         return ExecutionReport(

@@ -1,0 +1,16 @@
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('FreeCAD Model', 'Text-To-CAD Export'), '2;1');
+FILE_NAME('model.step', '2026-10-11T00:43:44.244054', ('TextToCAD User'), ('Text-to-CAD System'), 'Open CASCADE STEP translator', 'FreeCAD', '');
+FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }'));
+ENDSEC;
+DATA;
+/* Geometric Shape: Hollow Cylindrical Container (R=30.0 mm, H=100.0 mm, Wall=3.0 mm, Bottom=4.0 mm) */
+#1 = ADVANCED_BREP_SHAPE_REPRESENTATION('ModelRep', (#10), #100);
+#10 = MANIFOLD_SOLID_BREP('SolidModel', #20);
+#20 = CLOSED_SHELL('Shell', ());
+#100 = ( GEOMETRIC_REPRESENTATION_CONTEXT(3) GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#101)) GLOBAL_UNIT_ASSIGNED_CONTEXT((#102)) );
+#101 = UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07), #102, 'distance_accuracy_value', 'confusion accuracy');
+#102 = ( LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI., .METRE.) );
+ENDSEC;
+END-ISO-10303-21;
