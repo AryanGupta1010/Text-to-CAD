@@ -356,21 +356,91 @@ class MockProvider(BaseLLMProvider):
             }
             return json.dumps(spec, indent=2)
 
-        # Detect shape type
-        is_box = any(k in lower_prompt for k in ["cube", "box", "block", "enclosure", "rectangular plate", "plate"])
-        is_sphere = any(k in lower_prompt for k in ["sphere", "ball", "globe"])
-        is_bushing = any(k in lower_prompt for k in ["bushing", "flanged pipe", "pipe", "tube", "washer", "spacer", "ring"])
-        is_hollow_container = not is_bushing and any(k in lower_prompt for k in ["container", "cup", "can", "pot", "pocket"]) or ("hollow" in lower_prompt and "cylinder" in lower_prompt)
-        is_solid_cylinder = not is_hollow_container and not is_bushing and any(k in lower_prompt for k in ["cylinder", "rod", "pin", "shaft"])
+        # Isolate the user's actual request from the prompt template
+        req_match = re.search(r'request:\s*["\']?(.*?)["\']?(?:\n\n|\nremember|$)', lower_prompt, flags=re.DOTALL)
+        target_text = req_match.group(1).strip() if req_match else lower_prompt
+
+        # Detect shape type strictly on the user request text
+        is_l_pipe = any(k in target_text for k in ["l-shape", "l-shaped", "elbow", "90-degree", "90 degree", "curved bend", "curved pipe"]) or ("pipe" in target_text and ("bend" in target_text or "bent" in target_text or "curve" in target_text))
+        is_box = not is_l_pipe and (any(k in target_text for k in ["cube", "box", "block", "enclosure", "rectangular plate", "plate", "prism", "cuboid"]) or bool(re.search(r"\d+\s*(?:x|\*)\s*\d+\s*(?:x|\*)\s*\d+", target_text)))
+        is_sphere = not is_l_pipe and any(k in target_text for k in ["sphere", "ball", "globe"])
+        is_bushing = not is_l_pipe and any(k in target_text for k in ["bushing", "flanged pipe", "straight pipe", "tube", "washer", "spacer", "sleeve"])
+        is_hollow_container = not is_l_pipe and not is_bushing and (any(k in target_text for k in ["container", "cup", "can", "pot", "pocket"]) or ("hollow" in target_text and "cylinder" in target_text))
+        is_solid_cylinder = not is_l_pipe and not is_hollow_container and not is_bushing and any(k in target_text for k in ["cylinder", "rod", "pin", "shaft", "disc", "disk", "round bar"])
 
         params: Dict[str, float] = {}
 
+        # 0. L-Shaped / Bent Pipe
+        if is_l_pipe:
+            od_m = re.search(r"outer\s*diameter\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            outer_r = float(od_m.group(1)) / 2.0 if od_m else 10.0
+            if not od_m:
+                or_m = re.search(r"outer\s*radius\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+                if or_m:
+                    outer_r = float(or_m.group(1))
+                    outer_r = float(or_m.group(1))
+
+            id_m = re.search(r"inner\s*diameter\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            inner_r = float(id_m.group(1)) / 2.0 if id_m else 7.0
+            if not id_m:
+                ir_m = re.search(r"inner\s*radius\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+                if ir_m:
+                    inner_r = float(ir_m.group(1))
+
+            side_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:mm)?\s*long", lower_prompt)
+            l1 = float(side_m.group(1)) if side_m else 100.0
+            l2 = l1
+            l1_m = re.search(r"(?:length\s*1|arm\s*1|section\s*1)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            if l1_m:
+                l1 = float(l1_m.group(1))
+            l2_m = re.search(r"(?:length\s*2|arm\s*2|section\s*2)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            if l2_m:
+                l2 = float(l2_m.group(1))
+
+            bend_r = 30.0
+            br_m = re.search(r"(?:bend\s*radius|curve\s*radius)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            if br_m:
+                bend_r = float(br_m.group(1))
+
+            params = {
+                "outer_radius": outer_r,
+                "inner_radius": inner_r,
+                "length_1": l1,
+                "length_2": l2,
+                "bend_radius": bend_r,
+                "bend_angle": 90.0,
+                "wall_thickness": round(outer_r - inner_r, 4),
+            }
+            spec = {
+                "cad_engine": "FreeCAD",
+                "units": "mm",
+                "object_description": f"3D L-shaped hollow pipe with 90-degree curved bend (L1={l1}mm, L2={l2}mm, OD={outer_r*2}mm, ID={inner_r*2}mm)",
+                "features": [
+                    {
+                        "feature_type": "l_shaped_pipe",
+                        "dimensions": params,
+                        "parameters": {"shape": "elbow_bend", "bend_angle": 90.0},
+                        "geometric_constraints": ["tangent_continuous", "smooth_bend"],
+                        "dependencies": [],
+                        "expected_properties": {"is_solid": True, "is_hollow": True}
+                    }
+                ],
+                "parameters": params,
+                "constraints": ["90_degree_bend", "hollow"],
+                "operations": ["create_path_wire", "create_outer_profile", "create_inner_profile", "sweep_outer", "sweep_inner", "boolean_cut"],
+                "output_formats": ["STEP", "STL"],
+                "assumptions": ["XZ plane bend orientation", "Smooth tangential arc transition"],
+                "clarification_required": False,
+                "clarification_questions": []
+            }
+            return json.dumps(spec, indent=2)
+
         # 1. Box / Cube
-        if is_box:
-            # Check for cube side: "side of 50mm" or "cube of 40mm"
-            cube_match = re.search(r"(?:cube\s*(?:of|with\s*side)?|side)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+        elif is_box:
+            # Check for cube side: "40mm cube", "cube of 40mm", "side of 50mm"
+            cube_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:mm)?\s*cube|(?:cube\s*(?:of|with\s*side)?|side)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
             if cube_match:
-                s = float(cube_match.group(1))
+                s = float(cube_match.group(1) or cube_match.group(2))
                 params["length"] = s
                 params["width"] = s
                 params["height"] = s
@@ -531,8 +601,8 @@ class MockProvider(BaseLLMProvider):
             }
             return json.dumps(spec, indent=2)
 
-        # 5. Hollow Cylindrical Container (Default)
-        else:
+        # 5. Hollow Cylindrical Container
+        elif is_hollow_container:
             outer_r = 30.0
             height = 100.0
             wall_t = 3.0
@@ -592,25 +662,164 @@ class MockProvider(BaseLLMProvider):
             }
             return json.dumps(spec, indent=2)
 
+        # 6. Smart Generic Custom Shape
+        else:
+            nums = [float(x) for x in re.findall(r"\b\d+(?:\.\d+)?\b", lower_prompt)]
+            dim3 = re.search(r"(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)", lower_prompt)
+            if dim3:
+                l, w, h = float(dim3.group(1)), float(dim3.group(2)), float(dim3.group(3))
+                params = {"length": l, "width": w, "height": h}
+            elif len(nums) >= 3:
+                params = {"length": nums[0], "width": nums[1], "height": nums[2]}
+            elif len(nums) == 1:
+                params = {"length": nums[0], "width": nums[0], "height": nums[0]}
+            elif len(nums) == 2:
+                params = {"radius": nums[0], "height": nums[1]}
+            else:
+                params = {"length": 50.0, "width": 50.0, "height": 50.0}
+
+            f_type = "cylinder" if "radius" in params else "box"
+            spec = {
+                "cad_engine": "FreeCAD",
+                "units": "mm",
+                "object_description": f"Custom 3D CAD design",
+                "features": [
+                    {
+                        "feature_type": f_type,
+                        "dimensions": params,
+                        "parameters": {},
+                        "geometric_constraints": ["orthogonal" if f_type == "box" else "cylindrical_symmetry"],
+                        "dependencies": [],
+                        "expected_properties": {"is_solid": True}
+                    }
+                ],
+                "parameters": params,
+                "constraints": ["orthogonal" if f_type == "box" else "cylindrical_symmetry"],
+                "operations": [f"create_{f_type}"],
+                "output_formats": ["STEP", "STL"],
+                "assumptions": ["Origin at base coordinate"],
+                "clarification_required": False,
+                "clarification_questions": []
+            }
+            return json.dumps(spec, indent=2)
+
     def _generate_mock_script(self, lower_prompt: str) -> str:
         """Generates appropriate executable FreeCAD Python script for the requested shape."""
         # Isolate the target object definition (first 400 chars) from retrieved documentation
-        target_text = lower_prompt[:400]
-        is_box = any(k in target_text for k in ["cube", "box", "enclosure", "rectangular plate"])
-        is_sphere = any(k in target_text for k in ["sphere", "ball"])
-        is_bushing = any(k in target_text for k in ["bushing", "flanged pipe", "pipe", "tube", "washer", "spacer", "ring"])
-        is_solid_cyl = not is_bushing and any(k in target_text for k in ["solid cylinder", "rod", "pin", "shaft"])
+        target_text = lower_prompt[:500]
+        is_l_pipe = any(k in target_text for k in ["l-shape", "l-shaped", "elbow", "90-degree", "90 degree", "curved bend", "curved pipe"]) or ("pipe" in target_text and ("bend" in target_text or "bent" in target_text or "curve" in target_text))
+        is_box = not is_l_pipe and any(k in target_text for k in ["cube", "box", "enclosure", "rectangular plate"])
+        is_sphere = not is_l_pipe and any(k in target_text for k in ["sphere", "ball"])
+        is_bushing = not is_l_pipe and any(k in target_text for k in ["bushing", "flanged pipe", "straight pipe", "tube", "washer", "spacer", "ring"])
+        is_solid_cyl = not is_l_pipe and not is_bushing and any(k in target_text for k in ["solid cylinder", "rod", "pin", "shaft"])
 
-        if is_box:
-            # Box script
-            script = """import FreeCAD
+        if is_l_pipe:
+            od_m = re.search(r"outer\s*diameter\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            outer_radius = float(od_m.group(1)) / 2.0 if od_m else 10.0
+            if not od_m:
+                or_m = re.search(r"outer\s*radius\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+                if or_m:
+                    outer_radius = float(or_m.group(1))
+
+            id_m = re.search(r"inner\s*diameter\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            inner_radius = float(id_m.group(1)) / 2.0 if id_m else 7.0
+            if not id_m:
+                ir_m = re.search(r"inner\s*radius\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+                if ir_m:
+                    inner_radius = float(ir_m.group(1))
+
+            l_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:mm)?\s*long", target_text)
+            length_1 = float(l_m.group(1)) if l_m else 100.0
+            length_2 = length_1
+            l1_m = re.search(r"(?:length\s*1|arm\s*1|l1)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            if l1_m:
+                length_1 = float(l1_m.group(1))
+            l2_m = re.search(r"(?:length\s*2|arm\s*2|l2)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            if l2_m:
+                length_2 = float(l2_m.group(1))
+            bend_radius = 30.0
+            br_m = re.search(r"(?:bend\s*radius|curve\s*radius)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            if br_m:
+                bend_radius = float(br_m.group(1))
+
+            script = f"""import FreeCAD
+import Part
+import math
+
+def create_model():
+    doc = FreeCAD.newDocument("TextToCAD_Job")
+    outer_radius = {outer_radius}
+    inner_radius = {inner_radius}
+    length_1 = {length_1}
+    length_2 = {length_2}
+    bend_radius = {bend_radius}
+
+    s1 = max(10.0, length_1 - bend_radius)
+    s2 = max(10.0, length_2 - bend_radius)
+
+    # Trajectory path in XZ plane
+    p0 = FreeCAD.Vector(0, 0, 0)
+    p1 = FreeCAD.Vector(0, 0, s1)
+    line1 = Part.makeLine(p0, p1)
+
+    arc_center = FreeCAD.Vector(bend_radius, 0, s1)
+    p_mid = FreeCAD.Vector(bend_radius - bend_radius * math.cos(math.pi / 4), 0, s1 + bend_radius * math.sin(math.pi / 4))
+    p2 = FreeCAD.Vector(bend_radius, 0, s1 + bend_radius)
+    arc = Part.Arc(p1, p_mid, p2).toShape()
+
+    p3 = FreeCAD.Vector(length_2, 0, s1 + bend_radius)
+    line2 = Part.makeLine(p2, p3)
+
+    path_wire = Part.Wire([line1, arc, line2])
+
+    outer_circle = Part.makeCircle(outer_radius, p0, FreeCAD.Vector(0, 0, 1))
+    outer_face = Part.Face(Part.Wire([outer_circle]))
+    outer_pipe = outer_face.makePipe(path_wire)
+
+    inner_circle = Part.makeCircle(inner_radius, p0, FreeCAD.Vector(0, 0, 1))
+    inner_face = Part.Face(Part.Wire([inner_circle]))
+    inner_pipe = inner_face.makePipe(path_wire)
+
+    pipe = outer_pipe.cut(inner_pipe)
+    if not pipe.isValid():
+        raise RuntimeError("Generated L-shaped pipe geometry is invalid")
+
+    shape_obj = doc.addObject("Part::Feature", "LShapedPipe")
+    shape_obj.Shape = pipe
+    doc.recompute()
+
+    pipe.exportStep("model.step")
+    pipe.exportStl("model.stl")
+    doc.saveAs("model.FCStd")
+    return doc, shape_obj
+
+if __name__ == "__main__":
+    doc, shape_obj = create_model()
+"""
+        elif is_box:
+            cube_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:mm)?\s*cube|(?:cube\s*(?:of|with\s*side)?|side)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            dim3 = re.search(r"(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)", target_text)
+            lm = re.search(r"length\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            wm = re.search(r"width\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            hm = re.search(r"(?:height|thickness)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            if cube_m:
+                s = float(cube_m.group(1) or cube_m.group(2))
+                l, w, h = s, s, s
+            elif dim3:
+                l, w, h = float(dim3.group(1)), float(dim3.group(2)), float(dim3.group(3))
+            else:
+                l = float(lm.group(1)) if lm else 60.0
+                w = float(wm.group(1)) if wm else 40.0
+                h = float(hm.group(1)) if hm else 25.0
+
+            script = f"""import FreeCAD
 import Part
 
 def create_model():
     doc = FreeCAD.newDocument("TextToCAD_Job")
-    length = 60.0
-    width = 40.0
-    height = 25.0
+    length = {l}
+    width = {w}
+    height = {h}
     
     box = Part.makeBox(length, width, height)
     if not box.isValid():
@@ -629,12 +838,15 @@ if __name__ == "__main__":
     doc, shape_obj = create_model()
 """
         elif is_sphere:
-            script = """import FreeCAD
+            rm = re.search(r"(?:radius|diameter)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            radius = float(rm.group(1)) if rm else 25.0
+            if "diameter" in target_text and rm: radius = radius / 2.0
+            script = f"""import FreeCAD
 import Part
 
 def create_model():
     doc = FreeCAD.newDocument("TextToCAD_Job")
-    radius = 25.0
+    radius = {radius}
     
     sphere = Part.makeSphere(radius)
     if not sphere.isValid():
@@ -653,14 +865,24 @@ if __name__ == "__main__":
     doc, shape_obj = create_model()
 """
         elif is_bushing:
-            script = """import FreeCAD
+            outer_radius = 25.0
+            inner_radius = 15.0
+            height = 60.0
+            ro_m = re.search(r"(?:outer\s*radius|outer\s*dia)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            if ro_m: outer_radius = float(ro_m.group(1)) if "radius" in ro_m.group(0) else float(ro_m.group(1)) / 2.0
+            ri_m = re.search(r"(?:inner\s*radius|inner\s*dia|bore)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            if ri_m: inner_radius = float(ri_m.group(1)) if "radius" in ri_m.group(0) else float(ri_m.group(1)) / 2.0
+            hm = re.search(r"(?:height|length)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            if hm: height = float(hm.group(1))
+
+            script = f"""import FreeCAD
 import Part
 
 def create_model():
     doc = FreeCAD.newDocument("TextToCAD_Job")
-    outer_radius = 25.0
-    inner_radius = 15.0
-    height = 60.0
+    outer_radius = {outer_radius}
+    inner_radius = {inner_radius}
+    height = {height}
     
     outer_cyl = Part.makeCylinder(outer_radius, height)
     cutter = Part.makeCylinder(inner_radius, height + 2.0)
@@ -683,13 +905,19 @@ if __name__ == "__main__":
     doc, shape_obj = create_model()
 """
         elif is_solid_cyl:
-            script = """import FreeCAD
+            rm = re.search(r"(?:radius|diameter)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            hm = re.search(r"(?:height|length)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            radius = float(rm.group(1)) if rm else 20.0
+            if "diameter" in target_text and rm: radius = radius / 2.0
+            height = float(hm.group(1)) if hm else 50.0
+
+            script = f"""import FreeCAD
 import Part
 
 def create_model():
     doc = FreeCAD.newDocument("TextToCAD_Job")
-    radius = 20.0
-    height = 50.0
+    radius = {radius}
+    height = {height}
     
     cyl = Part.makeCylinder(radius, height)
     if not cyl.isValid():
@@ -707,7 +935,7 @@ def create_model():
 if __name__ == "__main__":
     doc, shape_obj = create_model()
 """
-        else:
+        elif any(k in target_text for k in ["container", "cup", "can", "pot"]) or ("hollow" in target_text and "cylinder" in target_text):
             # Hollow cylindrical container
             script = """import FreeCAD
 import Part
@@ -734,6 +962,38 @@ def create_model():
 
     container.exportStep("model.step")
     container.exportStl("model.stl")
+    doc.saveAs("model.FCStd")
+    return doc, shape_obj
+
+if __name__ == "__main__":
+    doc, shape_obj = create_model()
+"""
+        else:
+            # Custom solid matching extracted prompt dimensions
+            nums = [float(x) for x in re.findall(r"\b\d+(?:\.\d+)?\b", target_text)]
+            dim3 = re.search(r"(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)", target_text)
+            l = float(dim3.group(1)) if dim3 else (nums[0] if len(nums) > 0 else 50.0)
+            w = float(dim3.group(2)) if dim3 else (nums[1] if len(nums) > 1 else l)
+            h = float(dim3.group(3)) if dim3 else (nums[2] if len(nums) > 2 else l)
+            script = f"""import FreeCAD
+import Part
+
+def create_model():
+    doc = FreeCAD.newDocument("TextToCAD_Job")
+    length = {l}
+    width = {w}
+    height = {h}
+    
+    box = Part.makeBox(length, width, height)
+    if not box.isValid():
+        raise RuntimeError("Generated shape is invalid")
+        
+    shape_obj = doc.addObject("Part::Feature", "ModelPart")
+    shape_obj.Shape = box
+    doc.recompute()
+
+    box.exportStep("model.step")
+    box.exportStl("model.stl")
     doc.saveAs("model.FCStd")
     return doc, shape_obj
 

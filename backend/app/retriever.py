@@ -58,17 +58,33 @@ class HybridCADRetriever:
         queries.append(f"FreeCAD {spec.object_description}")
 
         # 2. Operations & CAD functions
-        ops = " ".join(spec.operations) if spec.operations else "cylinder cut boolean"
+        ops = " ".join(spec.operations) if spec.operations else "Part module geometry"
         queries.append(f"FreeCAD Part module {ops}")
 
         # 3. Features & geometry constraints
-        for feat in spec.features[:2]:
-            queries.append(f"FreeCAD Part.make{feat.feature_type.capitalize()} parameters constraints")
+        feature_types = [f.feature_type.lower() for f in spec.features]
+        desc_lower = spec.object_description.lower()
+        is_l_pipe = "l_shaped_pipe" in feature_types or any("bend" in f or "pipe" in f for f in feature_types) or "bend" in desc_lower or "elbow" in desc_lower
+        is_box = any(f in ["box", "cube", "plate", "prism"] for f in feature_types) or any(k in desc_lower for k in ["box", "cube", "plate", "block"])
+        is_sphere = "sphere" in feature_types or "sphere" in desc_lower or "spherical" in desc_lower
+        is_bushing = "bushing" in desc_lower or ("cylinder_pocket" in feature_types and "bottom_thickness" not in spec.parameters)
+        is_container = "container" in desc_lower or "closed bottom" in desc_lower or ("wall_thickness" in spec.parameters and "bottom_thickness" in spec.parameters)
 
-        # 4. Verified scripts & boolean combinations
-        if "cut" in ops.lower() or "pocket" in spec.object_description.lower() or "hollow" in spec.object_description.lower():
+        if is_l_pipe:
+            queries.append("FreeCAD swept pipe wire trajectory Part.Arc Part.makeLine makePipe")
+            queries.append("FreeCAD L-shaped hollow pipe 90 degree curved bend")
+        elif is_box:
+            queries.append("FreeCAD Part.makeBox rectangular prism plate cube length width height")
+        elif is_sphere:
+            queries.append("FreeCAD Part.makeSphere sphere radius")
+        elif is_bushing:
+            queries.append("FreeCAD cylindrical bushing sleeve through hole bore Part.makeCylinder cut")
+        elif is_container:
             queries.append("FreeCAD hollow container cylinder coaxial cut closed bottom")
             queries.append("FreeCAD Part.makeCylinder and Shape.cut examples")
+        else:
+            for feat in spec.features[:2]:
+                queries.append(f"FreeCAD Part.make{feat.feature_type.capitalize()} parameters constraints")
 
         # 5. Export formats
         if spec.output_formats:

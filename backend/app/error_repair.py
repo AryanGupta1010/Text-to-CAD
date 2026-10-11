@@ -23,14 +23,13 @@ GUIDELINES FOR REPAIR:
    import FreeCAD
    import Part
 2. If boolean cut failed (coincident faces or slivers):
-   - Make the cutting tool slightly taller (height + 1.0) and offset its base to ensure a clean cut through the open face.
-   - Example: Part.makeCylinder(inner_r, height - bottom_t + 1.0, FreeCAD.Vector(0,0,bottom_t), FreeCAD.Vector(0,0,1))
+   - Make the cutting tool slightly larger and offset its base to ensure a clean cut.
 3. If dimensions mismatched:
-   - Ensure variables match the exact requested parameters (outer_radius, height, wall_thickness, bottom_thickness).
-4. Always call container.isValid() and verify not isNull().
+   - Ensure variables match the exact requested specification parameters.
+4. Always call shape.isValid() and verify not isNull().
 5. Always export:
-   container.exportStep("model.step")
-   container.exportStl("model.stl")
+   shape.exportStep("model.step")
+   shape.exportStl("model.stl")
    doc.saveAs("model.FCStd")
 6. Return ONLY the corrected python script enclosed in ```python ... ``` block. No explanation text.
 """

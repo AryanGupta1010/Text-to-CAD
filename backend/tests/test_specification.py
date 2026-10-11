@@ -59,3 +59,19 @@ def test_invalid_dimension_rejection():
     spec = extractor._validate_and_normalize_specification(data, "Invalid container")
     assert spec.clarification_required is True
     assert any("Wall thickness" in q for q in spec.clarification_questions)
+
+
+def test_specification_extraction_l_shaped_pipe():
+    provider = MockProvider()
+    extractor = RequirementExtractor(provider)
+    prompt = "Create a 3D L-shaped hollow pipe with a smooth 90-degree curved bend connecting two straight sections. Make the pipe 100 mm long on each side, with an outer diameter of 20 mm and an inner diameter of 14 mm. Generate the model using FreeCAD Python and display the final design."
+    
+    spec = extractor.extract(prompt)
+    assert isinstance(spec, CADSpecification)
+    assert any(f.feature_type == "l_shaped_pipe" for f in spec.features)
+    assert spec.parameters["outer_radius"] == 10.0
+    assert spec.parameters["inner_radius"] == 7.0
+    assert spec.parameters["length_1"] == 100.0
+    assert spec.parameters["length_2"] == 100.0
+    assert spec.parameters["bend_radius"] == 30.0
+    assert spec.clarification_required is False

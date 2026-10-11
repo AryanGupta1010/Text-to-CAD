@@ -231,8 +231,40 @@ END-ISO-10303-21;
         lower = script.lower()
         info = {}
 
+        # 0. L-Shaped / Swept Pipe
+        is_l_pipe = "makepipe" in lower or "lshapedpipe" in lower or "l-shape" in lower or "l_shaped" in lower or ("bend_radius" in lower and ("outer_radius" in lower or "inner_radius" in lower))
+        if is_l_pipe:
+            r_out = 10.0
+            r_in = 7.0
+            l1 = 100.0
+            l2 = 100.0
+            bend_r = 30.0
+
+            ro_m = re.search(r"outer_radius\s*=\s*(\d+(?:\.\d+)?)", script)
+            if ro_m: r_out = float(ro_m.group(1))
+            ri_m = re.search(r"inner_radius\s*=\s*(\d+(?:\.\d+)?)", script)
+            if ri_m: r_in = float(ri_m.group(1))
+            l1_m = re.search(r"length_1\s*=\s*(\d+(?:\.\d+)?)", script)
+            if l1_m: l1 = float(l1_m.group(1))
+            l2_m = re.search(r"length_2\s*=\s*(\d+(?:\.\d+)?)", script)
+            if l2_m: l2 = float(l2_m.group(1))
+            br_m = re.search(r"bend_radius\s*=\s*(\d+(?:\.\d+)?)", script)
+            if br_m: bend_r = float(br_m.group(1))
+
+            info = {
+                "type": "l_shaped_pipe",
+                "outer_radius": r_out,
+                "inner_radius": r_in,
+                "length_1": l1,
+                "length_2": l2,
+                "bend_radius": bend_r,
+            }
+            mesh = self._construct_l_shaped_pipe_mesh(r_out, r_in, l1, l2, bend_r)
+            desc = f"L-Shaped Hollow Pipe (L1={l1} mm, L2={l2} mm, OD={r_out*2} mm, ID={r_in*2} mm, BendR={bend_r} mm)"
+            return mesh, desc, info
+
         # 1. Box / Cube
-        if "makebox" in lower or ("length" in lower and "width" in lower and "height" in lower):
+        elif "makebox" in lower or ("length" in lower and "width" in lower and "height" in lower):
             l = 60.0
             w = 40.0
             h = 25.0
@@ -298,7 +330,7 @@ END-ISO-10303-21;
             return mesh, desc, info
 
         # 5. Hollow Cylindrical Container
-        else:
+        elif "container" in lower or ("wall_thickness" in lower and "bottom_thickness" in lower):
             outer_r = 30.0
             height = 100.0
             wall_t = 3.0
@@ -318,6 +350,143 @@ END-ISO-10303-21;
             info = {"type": "hollow_cylinder", "outer_radius": outer_r, "inner_radius": inner_r, "height": height, "wall_thickness": wall_t, "bottom_thickness": bot_t}
             desc = f"Hollow Cylindrical Container (R={outer_r} mm, H={height} mm, Wall={wall_t} mm, Bottom={bot_t} mm)"
             return mesh, desc, info
+
+        # 6. Generic / Custom Script Mesh Synthesis
+        else:
+            lm = re.search(r"length\s*=\s*(\d+(?:\.\d+)?)", script)
+            wm = re.search(r"width\s*=\s*(\d+(?:\.\d+)?)", script)
+            hm = re.search(r"height\s*=\s*(\d+(?:\.\d+)?)", script)
+            rm = re.search(r"radius\s*=\s*(\d+(?:\.\d+)?)", script)
+
+            if rm:
+                r = float(rm.group(1))
+                h = float(hm.group(1)) if hm else 50.0
+                info = {"type": "cylinder", "radius": r, "height": h}
+                mesh = trimesh.creation.cylinder(radius=r, height=h, sections=64)
+                mesh.apply_translation([0, 0, h / 2.0])
+                desc = f"Solid Cylinder (R={r} mm, H={h} mm)"
+                return mesh, desc, info
+            else:
+                l = float(lm.group(1)) if lm else 50.0
+                w = float(wm.group(1)) if wm else l
+                h = float(hm.group(1)) if hm else l
+                info = {"type": "box", "length": l, "width": w, "height": h}
+                mesh = trimesh.creation.box([l, w, h])
+                mesh.apply_translation([l / 2.0, w / 2.0, h / 2.0])
+                desc = f"Solid Box ({l} x {w} x {h} mm)"
+                return mesh, desc, info
+
+    def _construct_l_shaped_pipe_mesh(self, r_out, r_in, l1, l2, bend_r, sections=32, curve_steps=16, straight_steps=8):
+        """Constructs a watertight, manifold 3D mesh for an L-shaped swept hollow pipe."""
+        import trimesh
+        import numpy as np
+
+        s1 = max(10.0, l1 - bend_r)
+        s2 = max(10.0, l2 - bend_r)
+
+        # Generate trajectory points and tangent vectors in XZ plane
+        pts = []
+        tans = []
+
+        # 1. Straight segment 1: (0, 0, 0) to (0, 0, s1)
+        for z in np.linspace(0, s1, straight_steps, endpoint=False):
+            pts.append(np.array([0.0, 0.0, z]))
+            tans.append(np.array([0.0, 0.0, 1.0]))
+
+        # 2. Smooth 90-degree curved bend:
+        for alpha in np.linspace(0, np.pi / 2, curve_steps, endpoint=False):
+            px = bend_r - bend_r * np.cos(alpha)
+            pz = s1 + bend_r * np.sin(alpha)
+            pts.append(np.array([px, 0.0, pz]))
+            tx = np.sin(alpha)
+            tz = np.cos(alpha)
+            tans.append(np.array([tx, 0.0, tz]))
+
+        # 3. Straight segment 2: (bend_r, 0, s1 + bend_r) to (l2, 0, s1 + bend_r)
+        for x in np.linspace(bend_r, l2, straight_steps, endpoint=True):
+            pts.append(np.array([x, 0.0, s1 + bend_r]))
+            tans.append(np.array([1.0, 0.0, 0.0]))
+
+        K = len(pts)
+        angles = np.linspace(0, 2 * np.pi, sections, endpoint=False)
+        cos_a = np.cos(angles)
+        sin_a = np.sin(angles)
+
+        verts = []
+        # Outer ring vertices: k * sections + j
+        for k in range(K):
+            P = pts[k]
+            T = tans[k]
+            B = np.array([0.0, 1.0, 0.0])
+            N = np.array([T[2], 0.0, -T[0]])
+            for c, s in zip(cos_a, sin_a):
+                v_out = P + r_out * (c * N + s * B)
+                verts.append(v_out)
+
+        # Inner ring vertices: K * sections + k * sections + j
+        for k in range(K):
+            P = pts[k]
+            T = tans[k]
+            B = np.array([0.0, 1.0, 0.0])
+            N = np.array([T[2], 0.0, -T[0]])
+            for c, s in zip(cos_a, sin_a):
+                v_in = P + r_in * (c * N + s * B)
+                verts.append(v_in)
+
+        verts = np.array(verts, dtype=np.float64)
+        faces = []
+
+        def outer_idx(k, j):
+            return k * sections + (j % sections)
+
+        def inner_idx(k, j):
+            return K * sections + k * sections + (j % sections)
+
+        # Outer pipe surface (outward facing normals)
+        for k in range(K - 1):
+            for j in range(sections):
+                nj = (j + 1) % sections
+                v0 = outer_idx(k, j)
+                v1 = outer_idx(k, nj)
+                v2 = outer_idx(k + 1, nj)
+                v3 = outer_idx(k + 1, j)
+                faces.append([v0, v1, v2])
+                faces.append([v0, v2, v3])
+
+        # Inner pipe surface (inward facing normals)
+        for k in range(K - 1):
+            for j in range(sections):
+                nj = (j + 1) % sections
+                v0 = inner_idx(k, j)
+                v1 = inner_idx(k, nj)
+                v2 = inner_idx(k + 1, nj)
+                v3 = inner_idx(k + 1, j)
+                faces.append([v0, v2, v1])
+                faces.append([v0, v3, v2])
+
+        # Start annular rim cap at k=0
+        for j in range(sections):
+            nj = (j + 1) % sections
+            o0 = outer_idx(0, j)
+            o1 = outer_idx(0, nj)
+            i0 = inner_idx(0, j)
+            i1 = inner_idx(0, nj)
+            faces.append([o0, i1, o1])
+            faces.append([o0, i0, i1])
+
+        # End annular rim cap at k=K-1
+        for j in range(sections):
+            nj = (j + 1) % sections
+            o0 = outer_idx(K - 1, j)
+            o1 = outer_idx(K - 1, nj)
+            i0 = inner_idx(K - 1, j)
+            i1 = inner_idx(K - 1, nj)
+            faces.append([o0, o1, i1])
+            faces.append([o0, i1, i0])
+
+        faces = np.array(faces, dtype=np.int32)
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+        return mesh
 
     def _construct_pipe_mesh(self, r_out, r_in, h, sections=64):
         """Constructs a watertight triangulated boundary mesh for a hollow tube/pipe."""

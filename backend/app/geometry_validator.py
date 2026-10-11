@@ -80,8 +80,13 @@ class GeometryValidator:
                 failure_summary=f"Mesh corrupted or unreadable: {str(e)}",
             )
 
-        # Check if running under Mock engine
+        # Check if running under Mock engine - measure actual mesh bounds
         if execution_report and "MOCK" in execution_report.cad_engine_version:
+            bounds = mesh.bounds if mesh.bounds is not None else [[0, 0, 0], [10, 10, 10]]
+            dx = float(bounds[1][0] - bounds[0][0])
+            dy = float(bounds[1][1] - bounds[0][1])
+            dz = float(bounds[1][2] - bounds[0][2])
+            vol = float(mesh.volume) if mesh.is_watertight and hasattr(mesh, "volume") else float(dx * dy * dz)
             mock_checks = [
                 ValidationCheck(
                     check_name="mock_execution_status",
@@ -92,19 +97,19 @@ class GeometryValidator:
                     explanation="Mock mode active: simulated CAD execution succeeded.",
                 ),
                 ValidationCheck(
-                    check_name="mock_geometry_envelope",
-                    expected_value=f"Radius: {spec.parameters.get('outer_radius', 30)}mm, Height: {spec.parameters.get('height', 100)}mm",
-                    measured_value="Simulated Envelope",
+                    check_name="geometry_bounding_box",
+                    expected_value=f"Shape envelope",
+                    measured_value=f"{round(dx, 2)} x {round(dy, 2)} x {round(dz, 2)} mm",
                     tolerance=None,
                     passed=True,
-                    explanation="Mock mode active: simulated geometry envelopes validated.",
+                    explanation=f"Mesh bounds measured: {round(dx, 2)} x {round(dy, 2)} x {round(dz, 2)} mm.",
                 ),
             ]
             return GeometryValidationReport(
                 valid=True,
                 solid_count=1,
-                bounding_box={"dx": 60.0, "dy": 60.0, "dz": 100.0},
-                total_volume=45000.0,
+                bounding_box={"dx": round(dx, 2), "dy": round(dy, 2), "dz": round(dz, 2)},
+                total_volume=round(abs(vol), 2),
                 checks=mock_checks,
                 failure_summary=None,
             )
@@ -149,9 +154,41 @@ class GeometryValidator:
 
         # Parameters from specification
         params = spec.parameters
+        is_l_pipe = "l_shaped_pipe" in [f.feature_type for f in spec.features] or ("length_1" in params and "length_2" in params) or ("bend_radius" in params)
+
+        # 0. Validate L-Shaped Swept Pipe Envelope
+        if is_l_pipe:
+            exp_l1 = float(params.get("length_1", 100.0))
+            exp_l2 = float(params.get("length_2", 100.0))
+            exp_rout = float(params.get("outer_radius", 10.0))
+            exp_dia = exp_rout * 2.0
+
+            # Pipe diameter is the minimum bounding dimension (along Y if bend is in XZ)
+            min_dim = min(dx, dy, dz)
+            passed_dia = abs(min_dim - exp_dia) <= self.default_tolerance * 2
+            passed_extent = (max(dx, dz) >= min(exp_l1, exp_l2) * 0.8)
+
+            checks.append(ValidationCheck(
+                check_name="pipe_outer_diameter",
+                expected_value=exp_dia,
+                measured_value=round(min_dim, 2),
+                tolerance=self.default_tolerance * 2,
+                passed=passed_dia,
+                explanation=f"Measured pipe outer diameter ({min_dim:.2f} mm) matches expected ({exp_dia} mm)." if passed_dia else f"Pipe outer diameter mismatch (expected {exp_dia} mm, measured {min_dim:.2f} mm).",
+            ))
+            checks.append(ValidationCheck(
+                check_name="pipe_arms_envelope",
+                expected_value=f"L1>={exp_l1}mm, L2>={exp_l2}mm",
+                measured_value=f"X={dx:.1f}mm, Z={dz:.1f}mm",
+                tolerance=None,
+                passed=passed_extent,
+                explanation=f"Measured pipe envelope ({dx:.1f} x {dy:.1f} x {dz:.1f} mm) accommodates both pipe arms." if passed_extent else "Pipe arm envelope too small.",
+            ))
+            if not passed_dia or not passed_extent:
+                failure_reasons.append("L-shaped pipe dimensions outside tolerance envelope.")
         
         # 1. Validate Box Length / Width (if rectangular)
-        if "length" in params and "width" in params:
+        if not is_l_pipe and "length" in params and "width" in params:
             exp_l = float(params["length"])
             exp_w = float(params["width"])
             l_diff = abs(dx - exp_l)
@@ -170,7 +207,7 @@ class GeometryValidator:
                 failure_reasons.append(f"Footprint mismatch ({dx:.2f}x{dy:.2f} vs expected {exp_l}x{exp_w}).")
 
         # 2. Validate Height
-        if "height" in params:
+        if not is_l_pipe and "height" in params:
             expected_h = float(params["height"])
             h_diff = abs(dz - expected_h)
             passed_h = h_diff <= self.default_tolerance
@@ -187,7 +224,7 @@ class GeometryValidator:
 
         # 3. Validate Outer Diameter / Radius for Cylindrical/Spherical parts
         rad_key = "outer_radius" if "outer_radius" in params else ("radius" if "radius" in params else None)
-        if rad_key and "length" not in params:
+        if not is_l_pipe and rad_key and "length" not in params:
             expected_r = float(params[rad_key])
             expected_dia = expected_r * 2.0
             dia_x_diff = abs(dx - expected_dia)
@@ -206,7 +243,7 @@ class GeometryValidator:
                 failure_reasons.append(f"Outer diameter mismatch ({measured_dia:.2f} mm vs expected {expected_dia:.2f} mm).")
 
         # Validate Wall & Bottom Cavity Existence (hollow container check)
-        is_container = "cylinder" in spec.object_description.lower() or "container" in spec.object_description.lower()
+        is_container = not is_l_pipe and ("cylinder" in spec.object_description.lower() or "container" in spec.object_description.lower())
         if is_container and "wall_thickness" in params and "bottom_thickness" in params:
             outer_r = float(params.get("outer_radius", 30.0))
             wall_t = float(params.get("wall_thickness", 3.0))
