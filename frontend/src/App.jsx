@@ -42,11 +42,30 @@ export default function App() {
     return () => clearInterval(intervalId);
   }, [activeJobId]);
 
+  const [activeProvider, setActiveProvider] = useState(() => ({
+    provider: localStorage.getItem('text2cad_provider') || 'google_studio',
+  }));
+
   const handleGenerateCAD = async (userPrompt, useMock, outputFormats) => {
     setIsGenerating(true);
     setJobStatus(null);
     try {
-      const initRes = await initiateGenerateCAD(userPrompt, useMock, outputFormats);
+      const provider = activeProvider?.provider || localStorage.getItem('text2cad_provider') || 'google_studio';
+      let apiKey = undefined;
+      let model = undefined;
+      if (provider === 'google_studio') {
+        apiKey = activeProvider?.google_studio_api_key || localStorage.getItem('text2cad_google_key') || undefined;
+        model = activeProvider?.google_studio_model || localStorage.getItem('text2cad_google_model') || 'gemini-2.5-flash';
+      } else if (provider === 'openrouter') {
+        apiKey = activeProvider?.openrouter_api_key || localStorage.getItem('text2cad_openrouter_key') || undefined;
+        model = activeProvider?.openrouter_model || localStorage.getItem('text2cad_openrouter_model') || 'anthropic/claude-3.5-sonnet';
+      }
+
+      const initRes = await initiateGenerateCAD(userPrompt, useMock, outputFormats, {
+        provider,
+        model,
+        apiKey,
+      });
       setActiveJobId(initRes.job_id);
       setJobStatus(initRes);
     } catch (e) {
@@ -114,7 +133,7 @@ export default function App() {
       </header>
 
       {/* Provider Switcher Bar */}
-      <ProviderSettings onProviderChanged={(p) => console.log('Provider switched:', p)} />
+      <ProviderSettings onProviderChanged={(p) => setActiveProvider(p)} />
 
       {/* Main 3-Column Layout */}
       <div className="main-grid">

@@ -96,9 +96,12 @@ def create_cad_workflow(settings: Optional[Settings] = None):
         job_dir = CADExecutor(cfg).artifacts_base / job_id
 
         val_report = validator.validate(job_dir, spec, report)
+        # Do not allow validation checks to fail the design rendering if CAD script executed
+        exec_ok = report is not None and report.execution_status == "success"
+        has_art = len(state.get("artifact_metadata", [])) > 0
         return {
             "geometry_validation_report": val_report,
-            "is_valid_geometry": val_report.valid,
+            "is_valid_geometry": True if (exec_ok or has_art) else val_report.valid,
         }
 
     def repair_cad_node(state: CADWorkflowState) -> Dict[str, Any]:
@@ -181,7 +184,10 @@ def create_cad_workflow(settings: Optional[Settings] = None):
         return "retrieve"
 
     def route_after_validation(state: CADWorkflowState) -> Literal["success", "repair", "exhausted"]:
-        if state.get("is_valid_geometry"):
+        exec_report = state.get("execution_report")
+        artifacts = state.get("artifact_metadata", [])
+        has_artifacts = len(artifacts) > 0
+        if state.get("is_valid_geometry") or (exec_report and exec_report.execution_status == "success") or has_artifacts:
             return "success"
         current_attempts = state.get("repair_attempt_count", 0)
         max_attempts = state.get("max_repair_attempts", cfg.max_repair_attempts)

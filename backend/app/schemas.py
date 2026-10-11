@@ -43,23 +43,35 @@ class ProviderInfo(BaseModel):
 
 
 class ProviderSettingsUpdate(BaseModel):
-    provider: Literal["cloud", "ollama", "mock"]
+    provider: Literal["cloud", "ollama", "mock", "openrouter", "google_studio"]
     cloud_provider: Optional[str] = None
     cloud_api_key: Optional[str] = None
     cloud_base_url: Optional[str] = None
     cloud_model: Optional[str] = None
     ollama_base_url: Optional[str] = None
     ollama_model: Optional[str] = None
+    openrouter_api_key: Optional[str] = None
+    openrouter_base_url: Optional[str] = None
+    openrouter_model: Optional[str] = None
+    google_studio_api_key: Optional[str] = None
+    google_studio_base_url: Optional[str] = None
+    google_studio_model: Optional[str] = None
 
 
 class ProviderTestRequest(BaseModel):
-    provider: Literal["cloud", "ollama", "mock"]
+    provider: Literal["cloud", "ollama", "mock", "openrouter", "google_studio"]
     cloud_provider: Optional[str] = None
     cloud_api_key: Optional[str] = None
     cloud_base_url: Optional[str] = None
     cloud_model: Optional[str] = None
     ollama_base_url: Optional[str] = None
     ollama_model: Optional[str] = None
+    openrouter_api_key: Optional[str] = None
+    openrouter_base_url: Optional[str] = None
+    openrouter_model: Optional[str] = None
+    google_studio_api_key: Optional[str] = None
+    google_studio_base_url: Optional[str] = None
+    google_studio_model: Optional[str] = None
 
 
 class ProviderTestResponse(BaseModel):
@@ -163,6 +175,10 @@ class GenerateCADRequest(BaseModel):
     prompt: str = Field(..., description="Natural language description of CAD object")
     output_formats: List[str] = Field(default_factory=lambda: ["STEP", "STL"])
     mock_mode: bool = Field(default=False, description="Force mock execution for testing")
+    provider: Optional[Literal["cloud", "ollama", "mock", "openrouter", "google_studio"]] = None
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
 
 
 class ExecuteCADRequest(BaseModel):

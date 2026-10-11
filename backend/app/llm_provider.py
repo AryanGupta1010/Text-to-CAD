@@ -13,73 +13,143 @@ logger = logging.getLogger(__name__)
 
 
 def clean_llm_output(text: str) -> str:
-    """Strips thinking tags (<think>...</think>) even if unclosed, and cleans whitespace."""
-    # Remove thinking tags even if unclosed (cut off by token limit)
-    text = re.sub(r"<think>[\s\S]*?(?:</think>|$)", "", text).strip()
-    return text
+    """Strips thinking tags (<think>...</think>) while preserving any actual content/code/JSON."""
+    if not text:
+        return ""
+
+    # 1. If proper </think> closing tag exists:
+    if "</think>" in text:
+        after = text.split("</think>", 1)[1].strip()
+        if after:
+            return after
+        # If nothing after </think>, look inside <think>...</think> for code or JSON
+        inside = text.split("</think>", 1)[0]
+        inside = re.sub(r"^.*?<think>", "", inside, flags=re.DOTALL).strip()
+        if inside:
+            return inside
+
+    # 2. If unclosed <think> tag:
+    if "<think>" in text:
+        # Check if there is markdown code block or JSON inside the unclosed thinking
+        code_block = re.search(r"```(?:python|json)?\s*([\s\S]*?)(?:```|$)", text)
+        if code_block and code_block.group(1).strip():
+            return code_block.group(0).strip()
+        # If there's a JSON structure {...}
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
+        if first_brace != -1 and last_brace > first_brace:
+            return text[first_brace:last_brace + 1].strip()
+        # Check for python CAD code
+        if "import FreeCAD" in text or "import Part" in text or "Part." in text:
+            indices = [i for i in [text.find("import FreeCAD"), text.find("import Part"), text.find("Part.")] if i != -1]
+            if indices:
+                return text[min(indices):].strip()
+        # If only pure thought text without any code/json, strip <think> tag prefix
+        return re.sub(r"^.*?<think>\s*", "", text, flags=re.DOTALL).strip()
+
+    return text.strip()
 
 
 def extract_json_from_text(text: str) -> Dict[str, Any]:
-    """Robustly extracts JSON from an LLM response even if surrounded by markdown or preamble."""
-    cleaned = clean_llm_output(text)
-    
-    # Try direct parse
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        pass
+    """Robustly extracts JSON from an LLM response even if surrounded by markdown, thinking tags, or preamble."""
+    if not text:
+        raise ValueError("LLM returned empty output.")
         
-    # Try finding markdown ```json ... ``` block
-    json_block = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned)
-    if json_block:
+    cleaned = clean_llm_output(text)
+
+    # Try direct parse on cleaned or raw
+    for candidate_str in [cleaned, text]:
         try:
-            return json.loads(json_block.group(1).strip())
+            return json.loads(candidate_str)
         except Exception:
             pass
-            
+
+    # Try finding markdown ```json ... ``` block in cleaned or text
+    for candidate_str in [cleaned, text]:
+        json_block = re.search(r"```(?:json)?\s*([\s\S]*?)(?:```|$)", candidate_str)
+        if json_block:
+            try:
+                return json.loads(json_block.group(1).strip())
+            except Exception:
+                pass
+
     # Try finding outermost { ... }
-    first_brace = cleaned.find("{")
-    last_brace = cleaned.rfind("}")
-    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-        candidate = cleaned[first_brace : last_brace + 1]
-        try:
-            return json.loads(candidate)
-        except Exception:
-            pass
-            
-    raise ValueError(f"Could not extract valid JSON from LLM output. Content snippet: {cleaned[:200]}")
+    for candidate_str in [cleaned, text]:
+        first_brace = candidate_str.find("{")
+        last_brace = candidate_str.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            candidate = candidate_str[first_brace : last_brace + 1]
+            try:
+                return json.loads(candidate)
+            except Exception:
+                pass
+
+    # Relaxed JSON repair (replace single quotes, strip trailing commas)
+    for candidate_str in [cleaned, text]:
+        first_brace = candidate_str.find("{")
+        last_brace = candidate_str.rfind("}")
+        if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+            candidate = candidate_str[first_brace : last_brace + 1]
+            relaxed = re.sub(r",\s*([\]}])", r"\1", candidate)
+            try:
+                return json.loads(relaxed)
+            except Exception:
+                pass
+
+    raise ValueError(f"Could not extract valid JSON from LLM output. Content snippet: {cleaned[:200] if cleaned else text[:200]}")
 
 
 def extract_python_code(text: str) -> str:
     """Robustly extracts python code from markdown blocks, unclosed blocks, or plain code."""
     cleaned = clean_llm_output(text)
 
+    code = ""
     # 1. Check for ```python ... (closed with ``` or unclosed at EOF)
-    match = re.search(r"```python\s*([\s\S]*?)(?:```|$)", cleaned)
-    if match and ("FreeCAD" in match.group(1) or "Part" in match.group(1)):
-        return match.group(1).strip()
+    for candidate_str in [cleaned, text]:
+        match = re.search(r"```python\s*([\s\S]*?)(?:```|$)", candidate_str)
+        if match and ("FreeCAD" in match.group(1) or "Part" in match.group(1) or "def " in match.group(1)):
+            code = match.group(1).strip()
+            break
 
-    # 2. Check for generic ``` ... (closed with ``` or unclosed at EOF)
-    match = re.search(r"```\s*([\s\S]*?)(?:```|$)", cleaned)
-    if match and ("FreeCAD" in match.group(1) or "Part" in match.group(1)):
-        return match.group(1).strip()
+    # 2. Check for generic ``` ...
+    if not code:
+        for candidate_str in [cleaned, text]:
+            match = re.search(r"```\s*([\s\S]*?)(?:```|$)", candidate_str)
+            if match and ("FreeCAD" in match.group(1) or "Part" in match.group(1) or "def " in match.group(1)):
+                code = match.group(1).strip()
+                break
 
-    # 3. If no backticks matched or backtick content had no CAD code, scan for import statement
-    import_idx = cleaned.find("import FreeCAD")
-    if import_idx == -1:
-        import_idx = cleaned.find("import Part")
-    if import_idx != -1:
-        code_part = cleaned[import_idx:]
-        # Remove trailing backticks or trailing explanation if any
-        code_part = re.sub(r"```.*$", "", code_part, flags=re.DOTALL).strip()
-        return code_part
+    # 3. Check for raw code starting with import
+    if not code:
+        for candidate_str in [cleaned, text]:
+            import_idx = candidate_str.find("import FreeCAD")
+            if import_idx == -1:
+                import_idx = candidate_str.find("import Part")
+            if import_idx != -1:
+                code_part = candidate_str[import_idx:]
+                code_part = re.sub(r"```.*$", "", code_part, flags=re.DOTALL).strip()
+                code = code_part
+                break
 
-    # 4. If code uses FreeCAD or Part calls without imports, auto-prepend
-    if "Part." in cleaned or "FreeCAD." in cleaned:
-        code_part = re.sub(r"```.*$", "", cleaned, flags=re.DOTALL).strip()
-        return "import FreeCAD\nimport Part\n\n" + code_part
+    # 4. If code uses Part. or FreeCAD. calls without imports
+    if not code:
+        for candidate_str in [cleaned, text]:
+            if "Part." in candidate_str or "FreeCAD." in candidate_str:
+                code_part = re.sub(r"```.*$", "", candidate_str, flags=re.DOTALL).strip()
+                code = code_part
+                break
 
-    return cleaned.strip()
+    if not code:
+        code = cleaned.strip() or text.strip()
+
+    # Prepend essential CAD imports if Part or FreeCAD references exist without import
+    if code and ("Part." in code or "FreeCAD." in code or "doc." in code):
+        if "import FreeCAD" not in code:
+            code = "import FreeCAD\n" + code
+        if "import Part" not in code:
+            code = "import Part\n" + code
+
+    return code
 
 
 class BaseLLMProvider(abc.ABC):
@@ -128,9 +198,15 @@ class OllamaProvider(BaseLLMProvider):
     ) -> str:
         url = f"{self.base_url}/api/chat"
         messages = []
-        sys_content = (system or "") + "\nDo not output <think> tags. Respond immediately with the exact requested content."
+        sys_content = (system or "").strip()
+        if json_mode:
+            sys_content += "\nRespond strictly with a valid JSON object matching the requested schema. Enclose JSON in ```json and ``` code block."
         messages.append({"role": "system", "content": sys_content.strip()})
-        messages.append({"role": "user", "content": prompt})
+
+        user_content = prompt
+        if json_mode and "```json" not in prompt:
+            user_content += "\n\nProvide ONLY the structured JSON output enclosed in ```json ... ``` markdown block."
+        messages.append({"role": "user", "content": user_content})
 
         payload: Dict[str, Any] = {
             "model": self.model_name,
@@ -138,16 +214,15 @@ class OllamaProvider(BaseLLMProvider):
             "stream": False,
             "options": {
                 "temperature": temperature,
-                "num_predict": 1024,
+                "num_predict": 4096,
                 "top_k": 40,
                 "top_p": 0.9,
             },
         }
-        if json_mode:
-            payload["format"] = "json"
 
         try:
-            with httpx.Client(timeout=300.0) as client:
+            # timeout=None allows local LLMs to run as long as needed without arbitrary cutoffs
+            with httpx.Client(timeout=None) as client:
                 resp = client.post(url, json=payload)
                 resp.raise_for_status()
                 data = resp.json()
@@ -155,9 +230,6 @@ class OllamaProvider(BaseLLMProvider):
                 return clean_llm_output(content)
         except httpx.ConnectError:
             raise ConnectionError(f"Failed to connect to Ollama at {self.base_url}. Ensure Ollama is running.")
-        except httpx.TimeoutException:
-            logger.error(f"Ollama request timed out after 300 seconds.")
-            raise RuntimeError("Ollama generation error: request timed out after 300s. Consider using Mock mode or a lighter model.")
         except Exception as e:
             logger.error(f"Ollama generation failed: {str(e)}")
             raise RuntimeError(f"Ollama generation error: {str(e)}")
@@ -305,6 +377,296 @@ class CloudProvider(BaseLLMProvider):
             )
 
 
+class OpenRouterProvider(BaseLLMProvider):
+    """OpenRouter Cloud Provider supporting hundreds of models via OpenRouter's unified API."""
+    def __init__(
+        self,
+        api_key: Optional[str],
+        base_url: str = "https://openrouter.ai/api/v1",
+        model_name: str = "anthropic/claude-3.5-sonnet",
+    ):
+        self.api_key = api_key
+        self.base_url = (base_url or "https://openrouter.ai/api/v1").rstrip("/")
+        self.model_name = model_name or "anthropic/claude-3.5-sonnet"
+
+    def get_provider_type(self) -> str:
+        return "openrouter"
+
+    def get_model_name(self) -> str:
+        return self.model_name
+
+    def generate(
+        self,
+        prompt: str,
+        system: Optional[str] = None,
+        json_mode: bool = False,
+        temperature: float = 0.2,
+    ) -> str:
+        if not self.api_key:
+            raise ValueError("OpenRouter API key is missing. Please provide your OpenRouter API key in Provider Settings.")
+
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key.strip()}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:5173",
+            "X-Title": "Text-To-CAD",
+        }
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        payload: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                content = data["choices"][0]["message"]["content"]
+                return clean_llm_output(content)
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(f"OpenRouter API error ({e.response.status_code}): {e.response.text[:300]}")
+        except Exception as e:
+            raise RuntimeError(f"OpenRouter request failed: {str(e)}")
+
+    def test_connection(self) -> ProviderTestResponse:
+        t0 = time.time()
+        if not self.api_key or not self.api_key.strip():
+            return ProviderTestResponse(
+                success=False,
+                provider="openrouter",
+                model=self.model_name,
+                message="OpenRouter API key is missing. Enter a valid key starting with 'sk-or-v1-'.",
+                latency_ms=0,
+                capabilities=[],
+            )
+
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key.strip()}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:5173",
+            "X-Title": "Text-To-CAD",
+        }
+        payload = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 5,
+        }
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                latency = round((time.time() - t0) * 1000, 2)
+                if resp.status_code == 200:
+                    return ProviderTestResponse(
+                        success=True,
+                        provider="openrouter",
+                        model=self.model_name,
+                        message=f"OpenRouter verified successfully with '{self.model_name}'.",
+                        latency_ms=latency,
+                        capabilities=["chat", "openrouter_routing", "json_mode"],
+                    )
+                else:
+                    return ProviderTestResponse(
+                        success=False,
+                        provider="openrouter",
+                        model=self.model_name,
+                        message=f"OpenRouter returned error ({resp.status_code}): {resp.text[:200]}",
+                        latency_ms=latency,
+                    )
+        except Exception as e:
+            return ProviderTestResponse(
+                success=False,
+                provider="openrouter",
+                model=self.model_name,
+                message=f"OpenRouter connection failed: {str(e)}",
+                latency_ms=round((time.time() - t0) * 1000, 2),
+            )
+
+
+class GoogleStudioProvider(BaseLLMProvider):
+    """Google AI Studio (Gemini) provider supporting direct Gemini API keys."""
+    def __init__(
+        self,
+        api_key: Optional[str],
+        base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai",
+        model_name: str = "gemini-2.0-flash",
+    ):
+        self.api_key = api_key
+        self.base_url = (base_url or "https://generativelanguage.googleapis.com/v1beta/openai").rstrip("/")
+        # Normalize model name - strip models/ prefix if present
+        clean_model = model_name or "gemini-2.0-flash"
+        if clean_model.startswith("models/"):
+            clean_model = clean_model[len("models/"):]
+        self.model_name = clean_model
+
+    def get_provider_type(self) -> str:
+        return "google_studio"
+
+    def get_model_name(self) -> str:
+        return self.model_name
+
+    def generate(
+        self,
+        prompt: str,
+        system: Optional[str] = None,
+        json_mode: bool = False,
+        temperature: float = 0.2,
+    ) -> str:
+        if not self.api_key:
+            raise ValueError("Google AI Studio API key is missing. Please provide your Gemini API key in Provider Settings.")
+
+        # Attempt 1: Google's official OpenAI-compatible endpoint
+        try:
+            return self._generate_openai_compat(prompt, system, json_mode, temperature)
+        except Exception as err:
+            logger.warning(f"Google Studio OpenAI-compatible endpoint error: {err}. Attempting native generateContent fallback.")
+            return self._generate_native(prompt, system, json_mode, temperature)
+
+    def _generate_openai_compat(
+        self,
+        prompt: str,
+        system: Optional[str],
+        json_mode: bool,
+        temperature: float,
+    ) -> str:
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key.strip()}",
+            "Content-Type": "application/json",
+        }
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        payload: Dict[str, Any] = {
+            "model": self.model_name,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        with httpx.Client(timeout=120.0) as client:
+            resp = client.post(url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"]
+            return clean_llm_output(content)
+
+    def _generate_native(
+        self,
+        prompt: str,
+        system: Optional[str],
+        json_mode: bool,
+        temperature: float,
+    ) -> str:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key.strip()}"
+        combined_prompt = f"{system}\n\n{prompt}" if system else prompt
+        
+        payload: Dict[str, Any] = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": combined_prompt}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": temperature,
+            },
+        }
+        if json_mode:
+            payload["generationConfig"]["responseMimeType"] = "application/json"
+
+        with httpx.Client(timeout=120.0) as client:
+            resp = client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            candidates = data.get("candidates", [])
+            if not candidates:
+                raise RuntimeError(f"Google AI Studio returned no candidate responses: {data}")
+            parts = candidates[0].get("content", {}).get("parts", [])
+            content = parts[0].get("text", "") if parts else ""
+            return clean_llm_output(content)
+
+    def test_connection(self) -> ProviderTestResponse:
+        t0 = time.time()
+        if not self.api_key or not self.api_key.strip():
+            return ProviderTestResponse(
+                success=False,
+                provider="google_studio",
+                model=self.model_name,
+                message="Google AI Studio API key is missing. Enter your Gemini API key from https://aistudio.google.com.",
+                latency_ms=0,
+                capabilities=[],
+            )
+
+        # Test OpenAI-compatible endpoint first
+        url = f"{self.base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.api_key.strip()}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 5,
+        }
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                resp = client.post(url, headers=headers, json=payload)
+                latency = round((time.time() - t0) * 1000, 2)
+                if resp.status_code == 200:
+                    return ProviderTestResponse(
+                        success=True,
+                        provider="google_studio",
+                        model=self.model_name,
+                        message=f"Connected to Google AI Studio successfully with '{self.model_name}'.",
+                        latency_ms=latency,
+                        capabilities=["chat", "gemini_multimodal", "json_mode"],
+                    )
+                # Fall back to native endpoint ping
+                native_url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key.strip()}"
+                native_resp = client.post(
+                    native_url,
+                    json={"contents": [{"parts": [{"text": "ping"}]}], "generationConfig": {"maxOutputTokens": 5}},
+                )
+                latency_native = round((time.time() - t0) * 1000, 2)
+                if native_resp.status_code == 200:
+                    return ProviderTestResponse(
+                        success=True,
+                        provider="google_studio",
+                        model=self.model_name,
+                        message=f"Connected to Google AI Studio (Native) successfully with '{self.model_name}'.",
+                        latency_ms=latency_native,
+                        capabilities=["chat", "gemini_native", "json_mode"],
+                    )
+                return ProviderTestResponse(
+                    success=False,
+                    provider="google_studio",
+                    model=self.model_name,
+                    message=f"Google Studio returned error ({resp.status_code}): {resp.text[:200]}",
+                    latency_ms=latency,
+                )
+        except Exception as e:
+            return ProviderTestResponse(
+                success=False,
+                provider="google_studio",
+                model=self.model_name,
+                message=f"Google AI Studio connection failed: {str(e)}",
+                latency_ms=round((time.time() - t0) * 1000, 2),
+            )
+
+
 class MockProvider(BaseLLMProvider):
     """Deterministic mock provider for offline testing and multi-shape verification."""
     def __init__(self, model_name: str = "mock-cad-engine"):
@@ -362,7 +724,9 @@ class MockProvider(BaseLLMProvider):
 
         # Detect shape type strictly on the user request text
         is_l_pipe = any(k in target_text for k in ["l-shape", "l-shaped", "elbow", "90-degree", "90 degree", "curved bend", "curved pipe"]) or ("pipe" in target_text and ("bend" in target_text or "bent" in target_text or "curve" in target_text))
-        is_box = not is_l_pipe and (any(k in target_text for k in ["cube", "box", "block", "enclosure", "rectangular plate", "plate", "prism", "cuboid"]) or bool(re.search(r"\d+\s*(?:x|\*)\s*\d+\s*(?:x|\*)\s*\d+", target_text)))
+        is_hex = not is_l_pipe and any(k in target_text for k in ["hex", "hexagon", "hexagonal"])
+        is_cone = not is_l_pipe and any(k in target_text for k in ["cone", "frustum", "nozzle", "funnel"])
+        is_box = not is_l_pipe and not is_hex and not is_cone and (any(k in target_text for k in ["cube", "box", "block", "enclosure", "rectangular plate", "plate", "prism", "cuboid"]) or bool(re.search(r"\d+\s*(?:x|\*)\s*\d+\s*(?:x|\*)\s*\d+", target_text)))
         is_sphere = not is_l_pipe and any(k in target_text for k in ["sphere", "ball", "globe"])
         is_bushing = not is_l_pipe and any(k in target_text for k in ["bushing", "flanged pipe", "straight pipe", "tube", "washer", "spacer", "sleeve"])
         is_hollow_container = not is_l_pipe and not is_bushing and (any(k in target_text for k in ["container", "cup", "can", "pot", "pocket"]) or ("hollow" in target_text and "cylinder" in target_text))
@@ -378,27 +742,26 @@ class MockProvider(BaseLLMProvider):
                 or_m = re.search(r"outer\s*radius\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
                 if or_m:
                     outer_r = float(or_m.group(1))
-                    outer_r = float(or_m.group(1))
 
-            id_m = re.search(r"inner\s*diameter\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            id_m = re.search(r"inner\s*diameter\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             inner_r = float(id_m.group(1)) / 2.0 if id_m else 7.0
             if not id_m:
-                ir_m = re.search(r"inner\s*radius\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+                ir_m = re.search(r"inner\s*radius\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
                 if ir_m:
                     inner_r = float(ir_m.group(1))
 
-            side_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:mm)?\s*long", lower_prompt)
+            side_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:mm)?\s*long", target_text)
             l1 = float(side_m.group(1)) if side_m else 100.0
             l2 = l1
-            l1_m = re.search(r"(?:length\s*1|arm\s*1|section\s*1)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            l1_m = re.search(r"(?:length\s*1|arm\s*1|section\s*1)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             if l1_m:
                 l1 = float(l1_m.group(1))
-            l2_m = re.search(r"(?:length\s*2|arm\s*2|section\s*2)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            l2_m = re.search(r"(?:length\s*2|arm\s*2|section\s*2)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             if l2_m:
                 l2 = float(l2_m.group(1))
 
             bend_r = 30.0
-            br_m = re.search(r"(?:bend\s*radius|curve\s*radius)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            br_m = re.search(r"(?:bend\s*radius|curve\s*radius)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             if br_m:
                 bend_r = float(br_m.group(1))
 
@@ -438,7 +801,7 @@ class MockProvider(BaseLLMProvider):
         # 1. Box / Cube
         elif is_box:
             # Check for cube side: "40mm cube", "cube of 40mm", "side of 50mm"
-            cube_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:mm)?\s*cube|(?:cube\s*(?:of|with\s*side)?|side)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            cube_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:mm)?\s*cube|(?:cube\s*(?:of|with\s*side)?|side)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             if cube_match:
                 s = float(cube_match.group(1) or cube_match.group(2))
                 params["length"] = s
@@ -446,15 +809,15 @@ class MockProvider(BaseLLMProvider):
                 params["height"] = s
             else:
                 # Length, width, height or dimensions like 100x60x10
-                dim3 = re.search(r"(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)", lower_prompt)
+                dim3 = re.search(r"(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)", target_text)
                 if dim3:
                     params["length"] = float(dim3.group(1))
                     params["width"] = float(dim3.group(2))
                     params["height"] = float(dim3.group(3))
                 else:
-                    l_m = re.search(r"length\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
-                    w_m = re.search(r"width\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
-                    h_m = re.search(r"(?:height|thickness)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+                    l_m = re.search(r"length\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+                    w_m = re.search(r"width\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+                    h_m = re.search(r"(?:height|thickness)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
                     params["length"] = float(l_m.group(1)) if l_m else 60.0
                     params["width"] = float(w_m.group(1)) if w_m else 40.0
                     params["height"] = float(h_m.group(1)) if h_m else 25.0
@@ -485,8 +848,8 @@ class MockProvider(BaseLLMProvider):
 
         # 2. Sphere
         elif is_sphere:
-            r_match = re.search(r"(?:radius|diameter)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
-            if "diameter" in lower_prompt and r_match:
+            r_match = re.search(r"(?:radius|diameter)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            if "diameter" in target_text and r_match:
                 params["radius"] = float(r_match.group(1)) / 2.0
             elif r_match:
                 params["radius"] = float(r_match.group(1))
@@ -517,18 +880,82 @@ class MockProvider(BaseLLMProvider):
             }
             return json.dumps(spec, indent=2)
 
+        # 2b. Cone / Frustum
+        elif is_cone:
+            r1_m = re.search(r"(?:bottom\s*radius|base\s*radius|radius1|radius)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            r1 = float(r1_m.group(1)) if r1_m else 25.0
+            r2_m = re.search(r"(?:top\s*radius|radius2)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            r2 = float(r2_m.group(1)) if r2_m else 0.0
+            h_m = re.search(r"(?:height|length)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            h = float(h_m.group(1)) if h_m else 60.0
+            params = {"radius1": r1, "radius2": r2, "height": h}
+            spec = {
+                "cad_engine": "FreeCAD",
+                "units": "mm",
+                "object_description": f"Cone with bottom radius {r1} mm, top radius {r2} mm, and height {h} mm",
+                "features": [
+                    {
+                        "feature_type": "cone",
+                        "dimensions": params,
+                        "parameters": {},
+                        "geometric_constraints": ["conical_symmetry"],
+                        "dependencies": [],
+                        "expected_properties": {"is_solid": True}
+                    }
+                ],
+                "parameters": params,
+                "constraints": ["conical_symmetry"],
+                "operations": ["create_cone"],
+                "output_formats": ["STEP", "STL"],
+                "assumptions": ["Origin at base coordinate"],
+                "clarification_required": False,
+                "clarification_questions": []
+            }
+            return json.dumps(spec, indent=2)
+
+        # 2c. Hexagonal Prism
+        elif is_hex:
+            r_m = re.search(r"(?:radius|size)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            r = float(r_m.group(1)) if r_m else 25.0
+            h_m = re.search(r"(?:height|thickness|length)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            h = float(h_m.group(1)) if h_m else 40.0
+            params = {"radius": r, "height": h}
+            spec = {
+                "cad_engine": "FreeCAD",
+                "units": "mm",
+                "object_description": f"Hexagonal prism with radius {r} mm and height {h} mm",
+                "features": [
+                    {
+                        "feature_type": "hexagonal_prism",
+                        "dimensions": params,
+                        "parameters": {},
+                        "geometric_constraints": ["hexagonal_symmetry"],
+                        "dependencies": [],
+                        "expected_properties": {"is_solid": True}
+                    }
+                ],
+                "parameters": params,
+                "constraints": ["hexagonal_symmetry"],
+                "operations": ["create_hexagonal_polygon", "extrude_face"],
+                "output_formats": ["STEP", "STL"],
+                "assumptions": ["Origin at base coordinate"],
+                "clarification_required": False,
+                "clarification_questions": []
+            }
+            return json.dumps(spec, indent=2)
+
         # 3. Bushing / Pipe / Tube
         elif is_bushing:
             outer_r = 25.0
             inner_r = 15.0
             length = 60.0
-            r_out = re.search(r"(?:outer\s*radius|outer\s*dia)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            r_out = re.search(r"(?:outer\s*radius|outer\s*dia)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             if r_out:
                 outer_r = float(r_out.group(1)) if "radius" in r_out.group(0) else float(r_out.group(1)) / 2.0
-            r_in = re.search(r"(?:inner\s*radius|inner\s*dia|bore)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            r_in = re.search(r"(?:inner\s*radius|inner\s*dia|bore)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             if r_in:
                 inner_r = float(r_in.group(1)) if "radius" in r_in.group(0) else float(r_in.group(1)) / 2.0
-            l_m = re.search(r"(?:length|height)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            l_m = re.search(r"(?:length|height)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             if l_m:
                 length = float(l_m.group(1))
 
@@ -569,10 +996,10 @@ class MockProvider(BaseLLMProvider):
         elif is_solid_cylinder:
             r = 20.0
             h = 50.0
-            r_m = re.search(r"(?:radius|diameter)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            r_m = re.search(r"(?:radius|diameter)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             if r_m:
                 r = float(r_m.group(1)) if "radius" in r_m.group(0) else float(r_m.group(1)) / 2.0
-            h_m = re.search(r"(?:height|length)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            h_m = re.search(r"(?:height|length)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             if h_m:
                 h = float(h_m.group(1))
 
@@ -608,16 +1035,16 @@ class MockProvider(BaseLLMProvider):
             wall_t = 3.0
             bot_t = 4.0
 
-            r_match = re.search(r"outer\s*radius\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            r_match = re.search(r"outer\s*radius\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             if r_match:
                 outer_r = float(r_match.group(1))
-            h_match = re.search(r"height\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            h_match = re.search(r"height\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             if h_match:
                 height = float(h_match.group(1))
-            w_match = re.search(r"wall\s*thickness\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            w_match = re.search(r"wall\s*thickness\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             if w_match:
                 wall_t = float(w_match.group(1))
-            b_match = re.search(r"bottom\s*thickness\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower_prompt)
+            b_match = re.search(r"bottom\s*thickness\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
             if b_match:
                 bot_t = float(b_match.group(1))
 
@@ -664,8 +1091,8 @@ class MockProvider(BaseLLMProvider):
 
         # 6. Smart Generic Custom Shape
         else:
-            nums = [float(x) for x in re.findall(r"\b\d+(?:\.\d+)?\b", lower_prompt)]
-            dim3 = re.search(r"(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)", lower_prompt)
+            nums = [float(x) for x in re.findall(r"\b\d+(?:\.\d+)?\b", target_text)]
+            dim3 = re.search(r"(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)\s*(?:x|\*)\s*(\d+(?:\.\d+)?)", target_text)
             if dim3:
                 l, w, h = float(dim3.group(1)), float(dim3.group(2)), float(dim3.group(3))
                 params = {"length": l, "width": w, "height": h}
@@ -705,11 +1132,12 @@ class MockProvider(BaseLLMProvider):
 
     def _generate_mock_script(self, lower_prompt: str) -> str:
         """Generates appropriate executable FreeCAD Python script for the requested shape."""
-        # Isolate the target object definition (first 400 chars) from retrieved documentation
         target_text = lower_prompt[:500]
         is_l_pipe = any(k in target_text for k in ["l-shape", "l-shaped", "elbow", "90-degree", "90 degree", "curved bend", "curved pipe"]) or ("pipe" in target_text and ("bend" in target_text or "bent" in target_text or "curve" in target_text))
         is_box = not is_l_pipe and any(k in target_text for k in ["cube", "box", "enclosure", "rectangular plate"])
         is_sphere = not is_l_pipe and any(k in target_text for k in ["sphere", "ball"])
+        is_cone = not is_l_pipe and any(k in target_text for k in ["cone", "frustum", "nozzle", "funnel"])
+        is_hex = not is_l_pipe and any(k in target_text for k in ["hex", "hexagon", "hexagonal", "prism"])
         is_bushing = not is_l_pipe and any(k in target_text for k in ["bushing", "flanged pipe", "straight pipe", "tube", "washer", "spacer", "ring"])
         is_solid_cyl = not is_l_pipe and not is_bushing and any(k in target_text for k in ["solid cylinder", "rod", "pin", "shaft"])
 
@@ -858,6 +1286,76 @@ def create_model():
 
     sphere.exportStep("model.step")
     sphere.exportStl("model.stl")
+    doc.saveAs("model.FCStd")
+    return doc, shape_obj
+
+if __name__ == "__main__":
+    doc, shape_obj = create_model()
+"""
+        elif is_cone:
+            r1_m = re.search(r"(?:bottom\s*radius|base\s*radius|radius1|radius)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            r1 = float(r1_m.group(1)) if r1_m else 25.0
+            r2_m = re.search(r"(?:top\s*radius|radius2)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            r2 = float(r2_m.group(1)) if r2_m else 0.0
+            hm = re.search(r"(?:height|length)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            height = float(hm.group(1)) if hm else 60.0
+            script = f"""import FreeCAD
+import Part
+
+def create_model():
+    doc = FreeCAD.newDocument("TextToCAD_Job")
+    radius1 = {r1}
+    radius2 = {r2}
+    height = {height}
+    
+    cone = Part.makeCone(radius1, radius2, height)
+    if not cone.isValid():
+        raise RuntimeError("Generated cone geometry is invalid")
+        
+    shape_obj = doc.addObject("Part::Feature", "ModelPart")
+    shape_obj.Shape = cone
+    doc.recompute()
+
+    cone.exportStep("model.step")
+    cone.exportStl("model.stl")
+    doc.saveAs("model.FCStd")
+    return doc, shape_obj
+
+if __name__ == "__main__":
+    doc, shape_obj = create_model()
+"""
+        elif is_hex:
+            rm = re.search(r"(?:radius|size)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            radius = float(rm.group(1)) if rm else 25.0
+            hm = re.search(r"(?:height|thickness|length)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", target_text)
+            height = float(hm.group(1)) if hm else 40.0
+            script = f"""import FreeCAD
+import Part
+import math
+
+def create_model():
+    doc = FreeCAD.newDocument("TextToCAD_Job")
+    radius = {radius}
+    height = {height}
+    
+    pts = []
+    for i in range(6):
+        ang = i * (2.0 * math.pi / 6.0)
+        pts.append(FreeCAD.Vector(radius * math.cos(ang), radius * math.sin(ang), 0))
+    pts.append(pts[0])
+    
+    wire = Part.makePolygon(pts)
+    face = Part.Face(wire)
+    solid = face.extrude(FreeCAD.Vector(0, 0, height))
+    if not solid.isValid():
+        raise RuntimeError("Generated hexagonal prism geometry is invalid")
+        
+    shape_obj = doc.addObject("Part::Feature", "ModelPart")
+    shape_obj.Shape = solid
+    doc.recompute()
+
+    solid.exportStep("model.step")
+    solid.exportStl("model.stl")
     doc.saveAs("model.FCStd")
     return doc, shape_obj
 
@@ -1025,6 +1523,18 @@ class ProviderFactory:
 
         if chosen == "ollama":
             return OllamaProvider(base_url=cfg.ollama_base_url, model_name=cfg.ollama_model)
+        elif chosen == "openrouter":
+            return OpenRouterProvider(
+                api_key=cfg.openrouter_api_key,
+                base_url=cfg.openrouter_base_url,
+                model_name=cfg.openrouter_model,
+            )
+        elif chosen == "google_studio":
+            return GoogleStudioProvider(
+                api_key=cfg.google_studio_api_key,
+                base_url=cfg.google_studio_base_url,
+                model_name=cfg.google_studio_model,
+            )
         elif chosen == "cloud":
             return CloudProvider(
                 api_key=cfg.cloud_api_key,
@@ -1035,4 +1545,4 @@ class ProviderFactory:
         elif chosen == "mock":
             return MockProvider()
         else:
-            raise ValueError(f"Unknown provider type: {chosen}. Choose 'cloud', 'ollama', or 'mock'.")
+            raise ValueError(f"Unknown provider type: {chosen}. Choose 'openrouter', 'google_studio', 'cloud', 'ollama', or 'mock'.")

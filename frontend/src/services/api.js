@@ -32,15 +32,21 @@ export async function fetchCadEngineStatus() {
   return res.json();
 }
 
-export async function initiateGenerateCAD(prompt, mockMode = false, outputFormats = ['STEP', 'STL']) {
+export async function initiateGenerateCAD(prompt, mockMode = false, outputFormats = ['STEP', 'STL'], options = {}) {
+  const payload = {
+    prompt,
+    mock_mode: mockMode,
+    output_formats: outputFormats,
+  };
+  if (options.provider) payload.provider = options.provider;
+  if (options.model) payload.model = options.model;
+  if (options.apiKey) payload.api_key = options.apiKey;
+  if (options.baseUrl) payload.base_url = options.baseUrl;
+
   const res = await fetch(`${API_BASE}/generate-cad`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      prompt,
-      mock_mode: mockMode,
-      output_formats: outputFormats,
-    }),
+    body: JSON.stringify(payload),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));

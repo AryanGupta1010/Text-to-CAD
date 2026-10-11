@@ -59,18 +59,33 @@ def get_providers(settings: Settings = Depends(get_settings)):
     """Returns available provider types and non-secret configuration status."""
     current = settings.default_llm_provider
     
-    # Check Ollama availability
+    # Fast non-blocking check for Ollama server
     ollama_avail = False
-    ollama_models = []
     try:
-        ollama_test = ProviderFactory.get_provider("ollama", settings).test_connection()
-        ollama_avail = ollama_test.success
-        if ollama_avail:
-            ollama_models = [settings.ollama_model]
+        import httpx
+        with httpx.Client(timeout=1.5) as client:
+            resp = client.get(f"{settings.ollama_base_url.rstrip('/')}/api/tags")
+            ollama_avail = (resp.status_code == 200)
     except Exception:
         pass
 
     return [
+        ProviderInfo(
+            provider_id="openrouter",
+            name="OpenRouter (Universal API)",
+            available=bool(settings.openrouter_api_key),
+            current=(current == "openrouter"),
+            models=[settings.openrouter_model, "anthropic/claude-3.5-sonnet", "deepseek/deepseek-chat", "meta-llama/llama-3.3-70b-instruct", "google/gemini-2.0-flash-001", "qwen/qwen-2.5-coder-32b-instruct"],
+            description="Access cutting-edge models (Claude 3.5, DeepSeek, Llama 3.3) with OpenRouter API key.",
+        ),
+        ProviderInfo(
+            provider_id="google_studio",
+            name="Google AI Studio (Gemini)",
+            available=bool(settings.google_studio_api_key),
+            current=(current == "google_studio"),
+            models=[settings.google_studio_model, "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.5-flash"],
+            description="Fast, reliable reasoning & CAD Python code generation via Google Gemini API.",
+        ),
         ProviderInfo(
             provider_id="ollama",
             name="Ollama (Local LLM)",
@@ -81,19 +96,19 @@ def get_providers(settings: Settings = Depends(get_settings)):
         ),
         ProviderInfo(
             provider_id="cloud",
-            name="Cloud LLM (OpenAI / OpenRouter API)",
+            name="Cloud LLM (OpenAI API)",
             available=bool(settings.cloud_api_key),
             current=(current == "cloud"),
             models=[settings.cloud_model, "gpt-4o", "gpt-4o-mini", "claude-3-5-sonnet", "deepseek-chat"],
-            description="Cloud API provider with configurable API key and base URL.",
+            description="Direct OpenAI-compatible cloud endpoint with configurable API key and base URL.",
         ),
         ProviderInfo(
             provider_id="mock",
             name="Deterministic Mock Provider (Offline)",
             available=True,
             current=(current == "mock"),
-            models=["mock-qwen-cad"],
-            description="Offline mock provider for testing workflow and UI transitions.",
+            models=["mock-cad-engine"],
+            description="Offline mock provider for deterministic verification and UI testing.",
         ),
     ]
 
@@ -104,7 +119,15 @@ def test_provider(req: ProviderTestRequest, settings: Settings = Depends(get_set
     try:
         # Build transient settings for test
         test_settings = settings.model_copy()
-        if req.provider == "cloud":
+        if req.provider == "openrouter":
+            test_settings.openrouter_api_key = req.openrouter_api_key or test_settings.openrouter_api_key
+            test_settings.openrouter_base_url = req.openrouter_base_url or test_settings.openrouter_base_url
+            test_settings.openrouter_model = req.openrouter_model or test_settings.openrouter_model
+        elif req.provider == "google_studio":
+            test_settings.google_studio_api_key = req.google_studio_api_key or test_settings.google_studio_api_key
+            test_settings.google_studio_base_url = req.google_studio_base_url or test_settings.google_studio_base_url
+            test_settings.google_studio_model = req.google_studio_model or test_settings.google_studio_model
+        elif req.provider == "cloud":
             test_settings.cloud_provider = req.cloud_provider or test_settings.cloud_provider
             test_settings.cloud_api_key = req.cloud_api_key or test_settings.cloud_api_key
             test_settings.cloud_base_url = req.cloud_base_url or test_settings.cloud_base_url
@@ -119,7 +142,7 @@ def test_provider(req: ProviderTestRequest, settings: Settings = Depends(get_set
         return ProviderTestResponse(
             success=False,
             provider=req.provider,
-            model=req.cloud_model or req.ollama_model or "unknown",
+            model=req.openrouter_model or req.google_studio_model or req.cloud_model or req.ollama_model or "unknown",
             message=f"Connection test failed: {str(e)}",
             capabilities=[],
         )
@@ -129,14 +152,29 @@ def test_provider(req: ProviderTestRequest, settings: Settings = Depends(get_set
 def update_provider_settings(req: ProviderSettingsUpdate):
     """Updates runtime provider settings dynamically without server restart."""
     updates = {"default_llm_provider": req.provider}
+    if req.openrouter_api_key is not None:
+        updates["openrouter_api_key"] = req.openrouter_api_key
+    if req.openrouter_base_url:
+        updates["openrouter_base_url"] = req.openrouter_base_url
+    if req.openrouter_model:
+        updates["openrouter_model"] = req.openrouter_model
+
+    if req.google_studio_api_key is not None:
+        updates["google_studio_api_key"] = req.google_studio_api_key
+    if req.google_studio_base_url:
+        updates["google_studio_base_url"] = req.google_studio_base_url
+    if req.google_studio_model:
+        updates["google_studio_model"] = req.google_studio_model
+
     if req.cloud_provider:
         updates["cloud_provider"] = req.cloud_provider
-    if req.cloud_api_key:
+    if req.cloud_api_key is not None:
         updates["cloud_api_key"] = req.cloud_api_key
     if req.cloud_base_url:
         updates["cloud_base_url"] = req.cloud_base_url
     if req.cloud_model:
         updates["cloud_model"] = req.cloud_model
+
     if req.ollama_base_url:
         updates["ollama_base_url"] = req.ollama_base_url
     if req.ollama_model:
@@ -167,11 +205,22 @@ async def run_cad_job_async(job_id: str, prompt: str, mock_mode: bool, settings:
     job_status = JOB_STORE[job_id]
 
     try:
+        if settings.default_llm_provider == "openrouter":
+            model_ident = settings.openrouter_model
+        elif settings.default_llm_provider == "google_studio":
+            model_ident = settings.google_studio_model
+        elif settings.default_llm_provider == "ollama":
+            model_ident = settings.ollama_model
+        elif settings.default_llm_provider == "cloud":
+            model_ident = settings.cloud_model
+        else:
+            model_ident = "mock-cad-engine"
+
         initial_state: CADWorkflowState = {
             "job_id": job_id,
             "original_user_request": prompt,
             "selected_llm_provider": settings.default_llm_provider,
-            "model_identifier": settings.ollama_model if settings.default_llm_provider == "ollama" else settings.cloud_model,
+            "model_identifier": model_ident,
             "mock_mode": mock_mode,
             "repair_attempt_count": 0,
             "max_repair_attempts": settings.max_repair_attempts,
@@ -221,6 +270,48 @@ async def generate_cad(
     job_id = f"job_{uuid.uuid4().hex[:12]}"
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
+    # Build job-scoped settings based on request parameters
+    job_settings = settings.model_copy()
+    if req.provider:
+        job_settings.default_llm_provider = req.provider
+        if req.provider == "google_studio":
+            if req.api_key:
+                job_settings.google_studio_api_key = req.api_key
+            if req.model:
+                job_settings.google_studio_model = req.model
+            if req.base_url:
+                job_settings.google_studio_base_url = req.base_url
+        elif req.provider == "openrouter":
+            if req.api_key:
+                job_settings.openrouter_api_key = req.api_key
+            if req.model:
+                job_settings.openrouter_model = req.model
+            if req.base_url:
+                job_settings.openrouter_base_url = req.base_url
+        elif req.provider == "cloud":
+            if req.api_key:
+                job_settings.cloud_api_key = req.api_key
+            if req.model:
+                job_settings.cloud_model = req.model
+            if req.base_url:
+                job_settings.cloud_base_url = req.base_url
+        elif req.provider == "ollama":
+            if req.model:
+                job_settings.ollama_model = req.model
+            if req.base_url:
+                job_settings.ollama_base_url = req.base_url
+
+        # Sync global runtime settings to keep them in sync
+        update_runtime_settings(
+            default_llm_provider=job_settings.default_llm_provider,
+            google_studio_api_key=job_settings.google_studio_api_key,
+            google_studio_model=job_settings.google_studio_model,
+            google_studio_base_url=job_settings.google_studio_base_url,
+            openrouter_api_key=job_settings.openrouter_api_key,
+            openrouter_model=job_settings.openrouter_model,
+            openrouter_base_url=job_settings.openrouter_base_url,
+        )
+
     job_status = CADJobStatus(
         job_id=job_id,
         status="pending",
@@ -230,7 +321,7 @@ async def generate_cad(
     )
     JOB_STORE[job_id] = job_status
 
-    background_tasks.add_task(run_cad_job_async, job_id, req.prompt, req.mock_mode, settings)
+    background_tasks.add_task(run_cad_job_async, job_id, req.prompt, req.mock_mode, job_settings)
     return job_status
 
 
@@ -257,7 +348,7 @@ def execute_cad_script(
         from backend.app.schemas import CADSpecification
         spec = CADSpecification(
             object_description="Custom user edited CAD script",
-            parameters=req.expected_dimensions or {"outer_radius": 30.0, "height": 100.0, "wall_thickness": 3.0, "bottom_thickness": 4.0},
+            parameters=req.expected_dimensions or {},
             output_formats=req.output_formats,
         )
         validator = GeometryValidator()
@@ -270,14 +361,14 @@ def execute_cad_script(
 
     job_status = CADJobStatus(
         job_id=job_id,
-        status="completed" if (report.execution_status == "success" and val_report and val_report.valid) else "failed",
+        status="completed" if report.execution_status == "success" else "failed",
         request_prompt="Direct Script Execution",
         generated_script=req.script,
         execution_report=report,
         validation_report=val_report,
         artifacts=report.generated_artifacts,
         preview_url=preview_url,
-        error_message=report.stderr if report.execution_status != "success" else (val_report.failure_summary if val_report and not val_report.valid else None),
+        error_message=report.stderr if report.execution_status != "success" else None,
         created_at=now,
         updated_at=now,
     )

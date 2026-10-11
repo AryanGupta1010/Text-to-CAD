@@ -37,21 +37,45 @@ class ContextBuilder:
         # Filter out conflicting verified scripts (e.g. don't feed hollow container script when building a box or L-pipe)
         feature_types = [f.feature_type.lower() for f in spec.features]
         desc = spec.object_description.lower()
-        is_l_pipe = "l_shaped_pipe" in feature_types or any("bend" in f or "pipe" in f for f in feature_types) or "bend" in desc or "elbow" in desc
-        is_box = any(f in ["box", "cube", "plate", "prism"] for f in feature_types) or any(k in desc for k in ["box", "cube", "plate", "block"])
-        is_sphere = "sphere" in feature_types or "sphere" in desc or "spherical" in desc
-        is_container = "container" in desc or ("wall_thickness" in spec.parameters and "bottom_thickness" in spec.parameters)
+        is_l_pipe = (
+            "l_shaped_pipe" in feature_types
+            or any("bend" in f or "pipe" in f or "elbow" in f for f in feature_types)
+            or any(k in desc for k in ["l-shape", "l shaped", "l-pipe", "elbow", "bend", "bent", "curve", "curved pipe", "90-degree", "90 degree", "swept pipe"])
+            or ("pipe" in desc and any(k in desc for k in ["bend", "bent", "curve", "curved", "elbow", "corner", "turn"]))
+            or ("vertical_length" in spec.parameters and "horizontal_length" in spec.parameters)
+        )
+        is_box = not is_l_pipe and (
+            any(f in ["box", "cube", "plate", "prism", "enclosure"] for f in feature_types)
+            or any(k in desc for k in ["box", "cube", "plate", "block", "enclosure", "prism"])
+        )
+        is_sphere = not is_l_pipe and not is_box and (
+            "sphere" in feature_types or any(k in desc for k in ["sphere", "spherical", "ball"])
+        )
+        is_bushing = not is_l_pipe and not is_box and not is_sphere and (
+            "bushing" in desc or "sleeve" in desc or "through hole" in desc or "straight tube" in desc
+        )
+        is_container = not is_l_pipe and not is_box and not is_sphere and not is_bushing and (
+            "container" in desc or "cup" in desc or "pocket" in desc or "closed bottom" in desc
+            or ("wall_thickness" in spec.parameters and "bottom_thickness" in spec.parameters)
+        )
 
         def is_relevant_chunk(c: RetrievedChunk) -> bool:
             c_text = (c.content + " " + c.metadata.get("title", "")).lower()
-            if (is_box or is_l_pipe or is_sphere) and not is_container:
-                if "hollow_container" in c_text or "closed bottom" in c_text:
+            if is_l_pipe:
+                if any(x in c_text for x in ["hollow_container", "bushing", "closed bottom", "cylindricalcontainer"]):
+                    return False
+            if is_box:
+                if any(x in c_text for x in ["hollow_container", "bushing", "makecylinder", "sphere"]):
+                    return False
+            if is_sphere:
+                if any(x in c_text for x in ["hollow_container", "bushing", "box", "cube", "makebox"]):
                     return False
             return True
 
         relevant_chunks = [c for c in chunks if is_relevant_chunk(c)]
         if not relevant_chunks:
-            relevant_chunks = chunks
+            # Only use general API docs, avoid cylinder scripts for custom shapes
+            relevant_chunks = [c for c in chunks if c.document_type != "verified_script"] or chunks
 
         # Sort chunks to place verified scripts first
         sorted_chunks = sorted(
@@ -80,17 +104,35 @@ class ContextBuilder:
 
         # 3. Shape-Targeted Geometric Best Practices
         if is_l_pipe:
-            practices = """### MODELING BEST PRACTICES (SWEPT / L-SHAPED HOLLOW PIPE) ###
-1. Trajectory wire in XZ plane: `path_wire = Part.Wire([line1, arc, line2])`
-2. Cross-section circular faces:
-   `outer_face = Part.Face(Part.Wire([Part.makeCircle(outer_radius, p0, FreeCAD.Vector(0,0,1))]))`
-   `inner_face = Part.Face(Part.Wire([Part.makeCircle(inner_radius, p0, FreeCAD.Vector(0,0,1))]))`
-3. Sweeps & Boolean subtraction:
-   `outer_pipe = outer_face.makePipe(path_wire)`
-   `inner_pipe = inner_face.makePipe(path_wire)`
-   `pipe = outer_pipe.cut(inner_pipe)`
-4. Verification: Check `shape.isValid()` before export.
-5. Export: Call `shape.exportStep("model.step")` and `shape.exportStl("model.stl")`."""
+            practices = """### MODELING BEST PRACTICES (3D SWEPT L-SHAPED HOLLOW PIPE WITH 90-DEGREE CURVED BEND) ###
+CRITICAL RULE: DO NOT create a simple cylinder! You must construct a swept L-shaped hollow pipe:
+1. Extract or define parameters: outer_radius, inner_radius, length_1, length_2, bend_radius.
+2. Trajectory wire in XZ plane connecting two perpendicular straight lines with an arc:
+   s1 = max(10.0, length_1 - bend_radius)
+   s2 = max(10.0, length_2 - bend_radius)
+   p0 = FreeCAD.Vector(0, 0, 0)
+   p1 = FreeCAD.Vector(0, 0, s1)
+   line1 = Part.makeLine(p0, p1)
+   p_mid = FreeCAD.Vector(bend_radius - bend_radius * math.cos(math.pi / 4), 0, s1 + bend_radius * math.sin(math.pi / 4))
+   p2 = FreeCAD.Vector(bend_radius, 0, s1 + bend_radius)
+   arc = Part.Arc(p1, p_mid, p2).toShape()
+   p3 = FreeCAD.Vector(length_2, 0, s1 + bend_radius)
+   line2 = Part.makeLine(p2, p3)
+   path_wire = Part.Wire([line1, arc, line2])
+3. Circular profiles at p0:
+   outer_circle = Part.makeCircle(outer_radius, p0, FreeCAD.Vector(0, 0, 1))
+   outer_face = Part.Face(Part.Wire([outer_circle]))
+   inner_circle = Part.makeCircle(inner_radius, p0, FreeCAD.Vector(0, 0, 1))
+   inner_face = Part.Face(Part.Wire([inner_circle]))
+4. Sweep & Boolean cut:
+   outer_pipe = outer_face.makePipe(path_wire)
+   inner_pipe = inner_face.makePipe(path_wire)
+   pipe = outer_pipe.cut(inner_pipe)
+5. Verification & Export:
+   if not pipe.isValid(): raise RuntimeError("Generated pipe shape is invalid")
+   pipe.exportStep("model.step")
+   pipe.exportStl("model.stl")
+   doc.saveAs("model.FCStd")"""
         elif is_box:
             practices = """### MODELING BEST PRACTICES (BOX / CUBE / PLATE / ENCLOSURE) ###
 1. Solid Box: `box = Part.makeBox(length, width, height)`

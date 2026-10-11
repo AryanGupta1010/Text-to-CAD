@@ -9,13 +9,23 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="allow")
 
     # LLM Settings
-    default_llm_provider: Literal["cloud", "ollama", "mock"] = "ollama"
+    default_llm_provider: Literal["cloud", "ollama", "mock", "openrouter", "google_studio"] = "ollama"
     
-    # Cloud Provider Settings
+    # Cloud Provider Settings (OpenAI / Generic)
     cloud_provider: str = "openai"
     cloud_api_key: Optional[str] = None
     cloud_base_url: str = "https://api.openai.com/v1"
     cloud_model: str = "gpt-4o-mini"
+    
+    # OpenRouter Provider Settings
+    openrouter_api_key: Optional[str] = None
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_model: str = "anthropic/claude-3.5-sonnet"
+
+    # Google AI Studio Provider Settings
+    google_studio_api_key: Optional[str] = None
+    google_studio_base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai"
+    google_studio_model: str = "gemini-2.0-flash"
     
     # Ollama Provider Settings
     ollama_base_url: str = "http://localhost:11434"
@@ -35,7 +45,7 @@ class Settings(BaseSettings):
     
     # CAD Runtime
     freecad_bin_path: Optional[str] = None
-    cad_execution_timeout_seconds: int = 30
+    cad_execution_timeout_seconds: int = 120
     max_repair_attempts: int = 2
     allow_unsafe_execution: bool = False
     

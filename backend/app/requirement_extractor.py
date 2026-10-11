@@ -42,7 +42,7 @@ CRITICAL RULES:
 3. Verify dimensional consistency: inner dimensions must fit inside outer dimensions.
 4. If essential geometric parameters (like primary dimensions or thickness for a hollow part) are missing or materially ambiguous, set "clarification_required": true and list targeted "clarification_questions".
 5. Do NOT hallucinate unspecified critical dimensions. Clearly list any inferred defaults in "assumptions".
-5. Return ONLY a valid JSON object. Do not include markdown preamble outside of JSON.
+5. Return the JSON specification enclosed within ```json and ``` markdown code block.
 """
 
 
@@ -75,7 +75,7 @@ Remember:
 - Normalize units to mm.
 - For hollow containers or pockets, compute inner radius = outer radius - wall thickness, and inner height = height - bottom thickness.
 - If dimensions are missing, ask clarification questions.
-- Output JSON ONLY.
+- Output ONLY the structured JSON enclosed in a ```json ... ``` code block.
 """
         data = None
         try:
@@ -303,7 +303,9 @@ Remember:
         lower = prompt.lower()
 
         is_l_pipe = any(k in lower for k in ["l-shape", "l-shaped", "elbow", "90-degree", "90 degree", "curved bend", "curved pipe"]) or ("pipe" in lower and ("bend" in lower or "bent" in lower or "curve" in lower))
-        is_box = not is_l_pipe and (any(k in lower for k in ["cube", "box", "block", "enclosure", "rectangular plate", "plate", "prism", "cuboid", "rectangular", "square"]) or bool(re.search(r"\d+\s*(?:x|\*)\s*\d+\s*(?:x|\*)\s*\d+", lower)))
+        is_hex = not is_l_pipe and any(k in lower for k in ["hex", "hexagon", "hexagonal"])
+        is_cone = not is_l_pipe and any(k in lower for k in ["cone", "frustum", "nozzle", "funnel"])
+        is_box = not is_l_pipe and not is_hex and not is_cone and (any(k in lower for k in ["cube", "box", "block", "enclosure", "rectangular plate", "plate", "prism", "cuboid", "rectangular", "square"]) or bool(re.search(r"\d+\s*(?:x|\*)\s*\d+\s*(?:x|\*)\s*\d+", lower)))
         is_sphere = not is_l_pipe and any(k in lower for k in ["sphere", "spherical", "ball", "globe"])
         is_bushing = not is_l_pipe and any(k in lower for k in ["bushing", "flanged pipe", "straight pipe", "tube", "washer", "spacer", "sleeve"])
         is_hollow_container = not is_l_pipe and not is_bushing and (any(k in lower for k in ["container", "cup", "can", "pot", "pocket"]) or ("hollow" in lower and "cylinder" in lower))
@@ -367,6 +369,7 @@ Remember:
             constraints = ["90_degree_bend", "hollow"]
 
         # 1. Box / Cube
+        elif is_box:
             cube_m = re.search(r"(\d+(?:\.\d+)?)\s*(?:mm)?\s*cube|(?:cube\s*(?:of|with\s*side)?|side)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
             if cube_m:
                 s = float(cube_m.group(1) or cube_m.group(2))
@@ -418,6 +421,44 @@ Remember:
             })
             operations = ["create_sphere"]
             constraints = ["spherical_symmetry"]
+
+        # 2b. Cone / Frustum
+        elif is_cone:
+            r1_m = re.search(r"(?:bottom\s*radius|base\s*radius|radius1|radius)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            r1 = float(r1_m.group(1)) if r1_m else 25.0
+            r2_m = re.search(r"(?:top\s*radius|radius2)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            r2 = float(r2_m.group(1)) if r2_m else 0.0
+            h_m = re.search(r"(?:height|length)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            h = float(h_m.group(1)) if h_m else 60.0
+            params = {"radius1": r1, "radius2": r2, "height": h}
+            features.append({
+                "feature_type": "cone",
+                "dimensions": params,
+                "parameters": {},
+                "geometric_constraints": ["conical_symmetry"],
+                "dependencies": [],
+                "expected_properties": {"is_solid": True}
+            })
+            operations = ["create_cone"]
+            constraints = ["conical_symmetry"]
+
+        # 2c. Hexagonal Prism / Polygon
+        elif is_hex:
+            r_m = re.search(r"(?:radius|size)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            r = float(r_m.group(1)) if r_m else 25.0
+            h_m = re.search(r"(?:height|thickness|length)\s*(?:of|:|=)?\s*(\d+(?:\.\d+)?)", lower)
+            h = float(h_m.group(1)) if h_m else 40.0
+            params = {"radius": r, "height": h}
+            features.append({
+                "feature_type": "hexagonal_prism",
+                "dimensions": params,
+                "parameters": {},
+                "geometric_constraints": ["hexagonal_symmetry"],
+                "dependencies": [],
+                "expected_properties": {"is_solid": True}
+            })
+            operations = ["create_hexagonal_polygon", "extrude_face"]
+            constraints = ["hexagonal_symmetry"]
 
         # 3. Bushing / Pipe / Tube
         elif is_bushing:
